@@ -6691,3 +6691,303 @@ class TestConvertToolsEnsuresObjectType:
         json_schema = result[0]["toolSpecification"]["inputSchema"]["json"]
         print(f"Schema: {json_schema}")
         assert json_schema["type"] == "object"
+
+
+# ==================================================================================================
+# Tests for tool specification sanitization through the shared conversion layer
+# ==================================================================================================
+
+
+class TestToolSpecSanitizationInConversion:
+    """
+    Tests that the rule-based tool sanitizer is applied by the shared conversion layer.
+
+    The gateway used to forward tool specifications that Kiro API rejects with an
+    opaque HTTP 400 ("Improperly formed request." / "Invalid tool use format." /
+    Bedrock TOOL_DUPLICATE). convert_tools_to_kiro_format now runs every tool
+    through kiro.tool_sanitizer, so both API surfaces and both request modes emit
+    the same repaired specs.
+    """
+
+    def test_empty_description_replaced_with_placeholder(self):
+        """
+        What it does: Verifies an empty description becomes a placeholder.
+        Purpose: An empty description is rejected upstream with "Invalid tool use format".
+        """
+        print("Action: converting a tool with an empty description...")
+        result = convert_tools_to_kiro_format([UnifiedTool(name="Read", description="")])
+        description = result[0]["toolSpecification"]["description"]
+        print(f"Description: {description}")
+        assert description == "Tool: Read"
+
+    def test_blank_description_replaced_with_placeholder(self):
+        """
+        What it does: Verifies a whitespace-only description becomes a placeholder.
+        Purpose: Blank descriptions carry no information for the model.
+        """
+        print("Action: converting a tool with a blank description...")
+        result = convert_tools_to_kiro_format([UnifiedTool(name="Read", description="   ")])
+        assert result[0]["toolSpecification"]["description"] == "Tool: Read"
+
+    def test_relocated_description_placeholder_preserved(self):
+        """
+        What it does: Verifies the long-description placeholder survives conversion.
+        Purpose: process_tools_with_long_descriptions leaves this reference behind
+                 and the sanitizer must not overwrite it.
+        """
+        print("Setup: tool with a relocated (long) description...")
+        long_tool = UnifiedTool(name="Workflow", description="D" * 20000, input_schema={"type": "object", "properties": {}})
+        processed, documentation = process_tools_with_long_descriptions([long_tool])
+        print(f"Documentation length: {len(documentation)}")
+        result = convert_tools_to_kiro_format(processed)
+        description = result[0]["toolSpecification"]["description"]
+        print(f"Description: {description}")
+        assert description == "[Full documentation in system prompt under '## Tool: Workflow']"
+
+    def test_duplicate_tool_names_collapsed(self):
+        """
+        What it does: Verifies duplicate tool names are collapsed to the first definition.
+        Purpose: Bedrock rejects the whole request with TOOL_DUPLICATE otherwise.
+        """
+        print("Action: converting two tools with the same name...")
+        tools = [
+            UnifiedTool(name="web_search", description="First", input_schema={"type": "object", "properties": {}}),
+            UnifiedTool(name="web_search", description="Second", input_schema={"type": "object", "properties": {}}),
+        ]
+        result = convert_tools_to_kiro_format(tools)
+        print(f"Emitted tools: {[t['toolSpecification']['name'] for t in result]}")
+        assert len(result) == 1
+        assert result[0]["toolSpecification"]["description"] == "First"
+
+    def test_missing_input_schema_repaired(self):
+        """
+        What it does: Verifies a None input schema becomes a valid object schema.
+        Purpose: A missing inputSchema is rejected with "Improperly formed request".
+        """
+        print("Action: converting a tool without an input schema...")
+        result = convert_tools_to_kiro_format([UnifiedTool(name="NoArgs", description="d", input_schema=None)])
+        assert result[0]["toolSpecification"]["inputSchema"] == {"json": {"type": "object", "properties": {}}}
+
+    def test_valid_tools_pass_through_unchanged(self):
+        """
+        What it does: Verifies already-valid tool specs are not mutated.
+        Purpose: Regression guard - the gateway must not rewrite valid user input.
+        """
+        print("Setup: valid tools using constructs Kiro API accepts...")
+        schema = {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "format": "uri"},
+                "status": {"anyOf": [{"type": "string", "enum": ["a"]}, {"type": "string", "const": "b"}]},
+                "meta": {"type": "object", "propertyNames": {"type": "string"}},
+                "id": {"type": "string", "pattern": "^wf_[a-z0-9-]{6,}$"},
+            },
+            "required": ["url"],
+        }
+        tools = [UnifiedTool(name="WebFetch", description="Fetch a URL", input_schema=schema)]
+        result = convert_tools_to_kiro_format(tools)
+        print(f"Emitted schema: {result[0]['toolSpecification']['inputSchema']['json']}")
+        assert result == [{
+            "toolSpecification": {
+                "name": "WebFetch",
+                "description": "Fetch a URL",
+                "inputSchema": {"json": schema},
+            }
+        }]
+
+    def test_input_schema_object_is_not_mutated(self):
+        """
+        What it does: Verifies the caller's schema dict is left untouched.
+        Purpose: Requests objects may be reused (e.g. by retry logic).
+        """
+        print("Setup: schema carrying $schema and additionalProperties...")
+        schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {"a": {"type": "string"}},
+            "additionalProperties": False,
+        }
+        tools = [UnifiedTool(name="Read", description="d", input_schema=schema)]
+        convert_tools_to_kiro_format(tools)
+        print(f"Original schema keys after conversion: {sorted(schema.keys())}")
+        assert "$schema" in schema
+        assert "additionalProperties" in schema
+
+    def test_invalid_tool_name_raises_value_error(self):
+        """
+        What it does: Verifies an unrepairable tool name raises ValueError.
+        Purpose: Routes convert ValueError into an actionable HTTP 400 on all four paths.
+        """
+        print("Action: converting a tool whose name contains a dot...")
+        with pytest.raises(ValueError) as exc_info:
+            convert_tools_to_kiro_format([UnifiedTool(name="mcp__server.tool", description="d")])
+        message = str(exc_info.value)
+        print(f"Error: {message[:160]}")
+        assert "mcp__server.tool" in message
+        assert "Solution:" in message
+
+    def test_long_tool_name_raises_with_actionable_message(self):
+        """
+        What it does: Verifies a 65-character name is reported with its length.
+        Purpose: Boundary of the Kiro API 64-character name limit.
+        """
+        print("Action: converting a tool with a 65-character name...")
+        with pytest.raises(ValueError) as exc_info:
+            convert_tools_to_kiro_format([UnifiedTool(name="a" * 65, description="d")])
+        message = str(exc_info.value)
+        assert "exceed Kiro API limit of 64 characters" in message
+        assert "65 characters" in message
+
+    def test_tool_name_at_limit_is_accepted(self):
+        """
+        What it does: Verifies a 64-character name converts successfully.
+        Purpose: Lock the accepted side of the boundary.
+        """
+        print("Action: converting a tool with a 64-character name...")
+        result = convert_tools_to_kiro_format([UnifiedTool(name="a" * 64, description="d")])
+        assert result[0]["toolSpecification"]["name"] == "a" * 64
+
+    def test_hyphenated_mcp_name_is_accepted(self):
+        """
+        What it does: Verifies MCP-style names with hyphens are accepted.
+        Purpose: Kiro API accepts hyphens; they must not be rewritten.
+        """
+        print("Action: converting an MCP-style tool name...")
+        name = "mcp__llm-memory__search_nodes"
+        result = convert_tools_to_kiro_format([UnifiedTool(name=name, description="d")])
+        assert result[0]["toolSpecification"]["name"] == name
+
+
+class TestBugPayloadToolSetConversion:
+    """
+    Tests reproducing the tool set from the captured REQUEST_BODY_INVALID request.
+
+    The failing request carried 26 client tools plus the auto-injected web_search
+    tool, one tool with an 18519-character description relocated into the system
+    prompt, and JSON Schema constructs such as anyOf/const/format/propertyNames.
+    The whole set must convert into a valid Kiro payload.
+    """
+
+    @staticmethod
+    def _build_bug_tool_set():
+        """
+        Build a tool set mirroring the captured failing request.
+
+        Returns:
+            List of UnifiedTool objects (27 entries, one with a long description).
+        """
+        names = [
+            "Agent", "AskUserQuestion", "Bash", "CronCreate", "CronDelete", "CronList",
+            "Edit", "EnterPlanMode", "EnterWorktree", "ExitPlanMode", "ExitWorktree",
+            "NotebookEdit", "Read", "ScheduleWakeup", "Skill", "TaskCreate", "TaskGet",
+            "TaskList", "TaskOutput", "TaskStop", "TaskUpdate", "WebFetch", "WebSearch",
+            "Workflow", "Write", "mcp__llm-memory__search_nodes",
+        ]
+        tools = []
+        for name in names:
+            schema = {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "anyOf": [
+                            {"type": "string", "enum": ["pending", "in_progress"]},
+                            {"type": "string", "const": "deleted"},
+                        ]
+                    },
+                    "url": {"type": "string", "format": "uri"},
+                    "metadata": {"type": "object", "propertyNames": {"type": "string"}},
+                },
+                "required": ["status"],
+                "additionalProperties": False,
+            }
+            description = "D" * 18519 if name == "Workflow" else f"Description of {name}"
+            tools.append(UnifiedTool(name=name, description=description, input_schema=schema))
+        # Gateway-injected MCP emulation tool
+        tools.append(UnifiedTool(
+            name="web_search",
+            description="Search the web",
+            input_schema={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+        ))
+        return tools
+
+    def test_full_tool_set_converts_to_valid_payload(self):
+        """
+        What it does: Verifies the 27-tool set from the bug converts cleanly.
+        Purpose: Every emitted spec must satisfy the constraints Kiro API enforces.
+        """
+        print("Setup: building the 27-tool set from the failing request...")
+        tools = self._build_bug_tool_set()
+        assert len(tools) == 27
+
+        processed, documentation = process_tools_with_long_descriptions(tools)
+        print(f"Relocated documentation length: {len(documentation)}")
+        result = convert_tools_to_kiro_format(processed)
+        print(f"Emitted tools: {len(result)}")
+
+        assert len(result) == 27
+        seen = set()
+        for entry in result:
+            spec = entry["toolSpecification"]
+            assert 0 < len(spec["name"]) <= 64
+            assert spec["name"] not in seen
+            seen.add(spec["name"])
+            assert spec["description"].strip()
+            json_schema = spec["inputSchema"]["json"]
+            assert json_schema["type"] == "object"
+            assert isinstance(json_schema["properties"], dict)
+            assert "$schema" not in json_schema
+            assert "additionalProperties" not in json_schema
+
+    def test_full_tool_set_preserves_accepted_schema_constructs(self):
+        """
+        What it does: Verifies anyOf/const/format/propertyNames survive conversion.
+        Purpose: These constructs are accepted upstream and must not be stripped.
+        """
+        print("Action: converting the bug tool set...")
+        processed, _ = process_tools_with_long_descriptions(self._build_bug_tool_set())
+        result = convert_tools_to_kiro_format(processed)
+        properties = result[0]["toolSpecification"]["inputSchema"]["json"]["properties"]
+        print(f"Property keys: {sorted(properties.keys())}")
+        assert properties["status"]["anyOf"][1]["const"] == "deleted"
+        assert properties["url"]["format"] == "uri"
+        assert properties["metadata"]["propertyNames"] == {"type": "string"}
+
+    def test_full_payload_build_includes_sanitized_tools(self):
+        """
+        What it does: Verifies build_kiro_payload emits the sanitized tool set.
+        Purpose: The shared payload builder feeds both APIs and both modes.
+        """
+        print("Action: building a full Kiro payload with the bug tool set...")
+        result = build_kiro_payload(
+            messages=[UnifiedMessage(role="user", content="Hello")],
+            system_prompt="You are a helpful assistant.",
+            model_id="claude-opus-4.8",
+            tools=self._build_bug_tool_set(),
+            conversation_id="conv-bug-1",
+            profile_arn="arn:aws:codewhisperer:us-east-1:123456789012:profile/ABCDEF123456",
+            thinking_config=ThinkingConfig(enabled=False),
+        )
+        context = result.payload["conversationState"]["currentMessage"]["userInputMessage"]["userInputMessageContext"]
+        print(f"Tools in payload: {len(context['tools'])}")
+        assert len(context["tools"]) == 27
+        assert "## Tool: Workflow" in result.tool_documentation
+        assert result.payload["profileArn"].startswith("arn:aws:codewhisperer:")
+
+    def test_payload_build_rejects_unrepairable_tool_name(self):
+        """
+        What it does: Verifies build_kiro_payload raises for an invalid tool name.
+        Purpose: The error must surface before any request reaches Kiro API.
+        """
+        print("Action: building a payload with an over-long tool name...")
+        with pytest.raises(ValueError) as exc_info:
+            build_kiro_payload(
+                messages=[UnifiedMessage(role="user", content="Hello")],
+                system_prompt="",
+                model_id="claude-opus-4.8",
+                tools=[UnifiedTool(name="mcp__GitHub__" + "a" * 60, description="d")],
+                conversation_id="conv-bug-2",
+                profile_arn="arn:aws:codewhisperer:us-east-1:123456789012:profile/ABCDEF123456",
+                thinking_config=ThinkingConfig(enabled=False),
+            )
+        assert "exceed Kiro API limit" in str(exc_info.value)

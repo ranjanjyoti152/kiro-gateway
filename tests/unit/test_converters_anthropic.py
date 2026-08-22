@@ -2510,3 +2510,175 @@ class TestAnthropicToKiroWebSearch:
         assert "server_tool_use" not in payload_json
         assert "web_search_tool_result" not in payload_json
         assert "<web_search>" in payload_json
+
+
+# ==================================================================================================
+# Tests for tool specification sanitization on the Anthropic surface
+# ==================================================================================================
+
+
+class TestAnthropicToolSpecSanitization:
+    """
+    Tests that the Anthropic surface emits sanitized Kiro tool specifications.
+
+    This is the surface where the captured REQUEST_BODY_INVALID request came from.
+    Sanitization lives in the shared conversion layer, so the same repairs apply to
+    streaming and non-streaming requests (both use this payload builder).
+    """
+
+    PROFILE_ARN = "arn:aws:codewhisperer:us-east-1:123456789012:profile/ABCDEF123456"
+
+    @classmethod
+    def _tools_payload(cls, tools):
+        """
+        Convert an Anthropic request with the given tools and return the Kiro specs.
+
+        Args:
+            tools: List of AnthropicTool definitions.
+
+        Returns:
+            List of Kiro toolSpecification entries.
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4-8",
+            max_tokens=1024,
+            messages=[AnthropicMessage(role="user", content="Hi")],
+            tools=tools,
+        )
+        payload = anthropic_to_kiro(request, "conv-anthropic-sanitize", cls.PROFILE_ARN)
+        context = payload["conversationState"]["currentMessage"]["userInputMessage"].get(
+            "userInputMessageContext", {}
+        )
+        return context.get("tools", [])
+
+    def test_empty_description_replaced(self):
+        """
+        What it does: Verifies an empty tool description is replaced.
+        Purpose: Kiro API rejects an empty description with "Invalid tool use format".
+        """
+        print("Setup: Anthropic tool with an empty description...")
+        tools = self._tools_payload([AnthropicTool(
+            name="Read", description="", input_schema={"type": "object", "properties": {}}
+        )])
+        print(f"Description: {tools[0]['toolSpecification']['description']}")
+        assert tools[0]["toolSpecification"]["description"] == "Tool: Read"
+
+    def test_schema_annotations_stripped_and_root_normalized(self):
+        """
+        What it does: Verifies $schema is stripped and the root becomes an object.
+        Purpose: Claude Code sends $schema on every tool definition.
+        """
+        print("Setup: Anthropic tool with $schema and no root type...")
+        tools = self._tools_payload([AnthropicTool(
+            name="Read",
+            description="Read a file",
+            input_schema={
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "properties": {"path": {"type": "string"}},
+                "additionalProperties": False,
+                "required": [],
+            },
+        )])
+        json_schema = tools[0]["toolSpecification"]["inputSchema"]["json"]
+        print(f"Schema: {json_schema}")
+        assert json_schema == {"type": "object", "properties": {"path": {"type": "string"}}}
+
+    def test_duplicate_tool_names_collapsed(self):
+        """
+        What it does: Verifies duplicate tool names are collapsed.
+        Purpose: Bedrock rejects duplicate tool definitions with TOOL_DUPLICATE.
+        """
+        print("Setup: Anthropic request declaring web_search twice...")
+        tool = AnthropicTool(
+            name="web_search", description="Search", input_schema={"type": "object", "properties": {}}
+        )
+        tools = self._tools_payload([tool, tool])
+        print(f"Emitted tools: {len(tools)}")
+        assert len(tools) == 1
+
+    def test_long_description_relocated_and_placeholder_kept(self):
+        """
+        What it does: Verifies a relocated long description leaves a valid placeholder.
+        Purpose: This is the exact shape of the 'Workflow' tool in the failing request.
+        """
+        print("Setup: Anthropic tool with an 18519-character description...")
+        tools = self._tools_payload([AnthropicTool(
+            name="Workflow", description="D" * 18519, input_schema={"type": "object", "properties": {}}
+        )])
+        description = tools[0]["toolSpecification"]["description"]
+        print(f"Description: {description}")
+        assert description == "[Full documentation in system prompt under '## Tool: Workflow']"
+
+    def test_invalid_tool_name_raises_value_error(self):
+        """
+        What it does: Verifies an over-long tool name raises ValueError.
+        Purpose: Routes turn this into an actionable HTTP 400 for both modes.
+        """
+        print("Setup: Anthropic tool with a 70-character name...")
+        with pytest.raises(ValueError) as exc_info:
+            self._tools_payload([AnthropicTool(
+                name="a" * 70, description="d", input_schema={"type": "object", "properties": {}}
+            )])
+        print(f"Error: {str(exc_info.value)[:120]}")
+        assert "exceed Kiro API limit" in str(exc_info.value)
+
+    def test_valid_tools_unchanged(self):
+        """
+        What it does: Verifies valid tools are emitted verbatim.
+        Purpose: Regression guard against gratuitous mutation of user input.
+        """
+        print("Setup: Anthropic tool using constructs Kiro API accepts...")
+        schema = {
+            "type": "object",
+            "properties": {
+                "status": {"anyOf": [{"type": "string", "enum": ["a"]}, {"type": "string", "const": "b"}]},
+                "url": {"type": "string", "format": "uri"},
+            },
+            "required": ["status"],
+        }
+        tools = self._tools_payload([AnthropicTool(
+            name="TaskUpdate", description="Update a task", input_schema=schema
+        )])
+        assert tools == [{
+            "toolSpecification": {
+                "name": "TaskUpdate",
+                "description": "Update a task",
+                "inputSchema": {"json": schema},
+            }
+        }]
+
+    def test_both_surfaces_produce_identical_specs(self):
+        """
+        What it does: Verifies OpenAI and Anthropic emit identical sanitized specs.
+        Purpose: Complete feature consistency across API surfaces (AGENTS.md section 10).
+        """
+        print("Setup: the same logical tool declared on both surfaces...")
+        raw_schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "properties": {"query": {"type": "string", "minLength": 2}},
+            "additionalProperties": False,
+            "required": [],
+        }
+
+        anthropic_tools = self._tools_payload([AnthropicTool(
+            name="WebSearch", description="", input_schema=dict(raw_schema)
+        )])
+
+        from kiro.converters_openai import build_kiro_payload as build_openai_payload
+        from kiro.models_openai import ChatCompletionRequest, ChatMessage, Tool, ToolFunction
+
+        openai_request = ChatCompletionRequest(
+            model="claude-opus-4.8",
+            messages=[ChatMessage(role="user", content="Hi")],
+            tools=[Tool(type="function", function=ToolFunction(
+                name="WebSearch", description="", parameters=dict(raw_schema)
+            ))],
+        )
+        openai_payload = build_openai_payload(openai_request, "conv-parity", self.PROFILE_ARN)
+        openai_tools = openai_payload["conversationState"]["currentMessage"]["userInputMessage"][
+            "userInputMessageContext"
+        ]["tools"]
+
+        print(f"Anthropic: {anthropic_tools}")
+        print(f"OpenAI:    {openai_tools}")
+        assert anthropic_tools == openai_tools

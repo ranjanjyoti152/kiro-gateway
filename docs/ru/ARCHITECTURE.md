@@ -82,6 +82,7 @@ kiro-gateway/
 │   │   # CORE LAYER - Общее ядро для всех API
 │   │   # ═══════════════════════════════════════════════════════
 │   ├── converters_core.py     # Общая логика построения Kiro payload
+│   ├── tool_sanitizer.py      # Правила санитизации спецификаций инструментов Kiro
 │   ├── streaming_core.py      # Общая логика парсинга Kiro stream
 │   │
 │   │   # ═══════════════════════════════════════════════════════
@@ -804,6 +805,7 @@ data: [DONE]
 | `parsers.py` | Парсинг AWS SSE |
 | `tokenizer.py` | Подсчёт токенов |
 | `converters_core.py` | Построение Kiro payload |
+| `tool_sanitizer.py` | Ограничения спецификаций инструментов Kiro (имена, описания, схемы, дубликаты) |
 | `streaming_core.py` | Парсинг Kiro stream |
 
 ## 10. Зависимости

@@ -82,6 +82,7 @@ kiro-gateway/
 │   │   # CORE LAYER - Shared core for all APIs
 │   │   # ═══════════════════════════════════════════════════════
 │   ├── converters_core.py     # Shared Kiro payload building logic
+│   ├── tool_sanitizer.py      # Rule-based Kiro tool specification sanitizer
 │   ├── streaming_core.py      # Shared Kiro stream parsing logic
 │   │
 │   │   # ═══════════════════════════════════════════════════════
@@ -804,6 +805,7 @@ When adding a new format, the following components work out of the box:
 | `parsers.py` | AWS SSE parsing |
 | `tokenizer.py` | Token counting |
 | `converters_core.py` | Kiro payload building |
+| `tool_sanitizer.py` | Kiro tool specification constraints (names, descriptions, schemas, duplicates) |
 | `streaming_core.py` | Kiro stream parsing |
 
 ## 10. Dependencies

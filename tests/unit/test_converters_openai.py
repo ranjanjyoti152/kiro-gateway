@@ -1872,3 +1872,142 @@ class TestBuildKiroPayloadIntegration:
         print(f"Checking for <max_thinking_length>{expected_budget}</max_thinking_length>...")
         assert f"<max_thinking_length>{expected_budget}</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+
+# ==================================================================================================
+# Tests for tool specification sanitization on the OpenAI surface
+# ==================================================================================================
+
+
+class TestOpenAIToolSpecSanitization:
+    """
+    Tests that the OpenAI surface emits sanitized Kiro tool specifications.
+
+    Sanitization lives in the shared conversion layer, so the OpenAI surface must
+    produce specs that satisfy every Kiro API tool constraint for both streaming
+    and non-streaming requests (the payload builder is shared by both modes).
+    """
+
+    @staticmethod
+    def _tools_payload(request):
+        """
+        Extract the Kiro tool specs from a converted OpenAI request.
+
+        Args:
+            request: ChatCompletionRequest to convert.
+
+        Returns:
+            List of Kiro toolSpecification entries (empty list when absent).
+        """
+        payload = build_kiro_payload(
+            request,
+            "conv-openai-sanitize",
+            "arn:aws:codewhisperer:us-east-1:123456789012:profile/ABCDEF123456",
+        )
+        context = payload["conversationState"]["currentMessage"]["userInputMessage"].get(
+            "userInputMessageContext", {}
+        )
+        return context.get("tools", [])
+
+    def test_empty_description_replaced(self):
+        """
+        What it does: Verifies an empty tool description is replaced.
+        Purpose: Kiro API rejects an empty description with "Invalid tool use format".
+        """
+        print("Setup: OpenAI request with an empty tool description...")
+        request = ChatCompletionRequest(
+            model="claude-sonnet-4.5",
+            messages=[ChatMessage(role="user", content="Hi")],
+            tools=[Tool(type="function", function=ToolFunction(
+                name="Read", description="", parameters={"type": "object", "properties": {}}
+            ))],
+        )
+        tools = self._tools_payload(request)
+        print(f"Description: {tools[0]['toolSpecification']['description']}")
+        assert tools[0]["toolSpecification"]["description"] == "Tool: Read"
+
+    def test_schema_annotations_stripped_and_root_normalized(self):
+        """
+        What it does: Verifies $schema is stripped and the root becomes an object.
+        Purpose: Both constraints are enforced by Bedrock / Kiro API.
+        """
+        print("Setup: OpenAI request with $schema and a missing root type...")
+        request = ChatCompletionRequest(
+            model="claude-sonnet-4.5",
+            messages=[ChatMessage(role="user", content="Hi")],
+            tools=[Tool(type="function", function=ToolFunction(
+                name="Read",
+                description="Read a file",
+                parameters={
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "properties": {"path": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            ))],
+        )
+        json_schema = self._tools_payload(request)[0]["toolSpecification"]["inputSchema"]["json"]
+        print(f"Schema: {json_schema}")
+        assert json_schema == {"type": "object", "properties": {"path": {"type": "string"}}}
+
+    def test_duplicate_tool_names_collapsed(self):
+        """
+        What it does: Verifies duplicate tool names are collapsed.
+        Purpose: Bedrock rejects duplicate tool definitions with TOOL_DUPLICATE.
+        """
+        print("Setup: OpenAI request declaring the same tool twice...")
+        tool = Tool(type="function", function=ToolFunction(
+            name="Read", description="Read a file", parameters={"type": "object", "properties": {}}
+        ))
+        request = ChatCompletionRequest(
+            model="claude-sonnet-4.5",
+            messages=[ChatMessage(role="user", content="Hi")],
+            tools=[tool, tool],
+        )
+        tools = self._tools_payload(request)
+        print(f"Emitted tools: {len(tools)}")
+        assert len(tools) == 1
+
+    def test_invalid_tool_name_raises_value_error(self):
+        """
+        What it does: Verifies an unrepairable tool name raises ValueError.
+        Purpose: Routes turn this into an actionable HTTP 400 for both modes.
+        """
+        print("Setup: OpenAI request with a dotted tool name...")
+        request = ChatCompletionRequest(
+            model="claude-sonnet-4.5",
+            messages=[ChatMessage(role="user", content="Hi")],
+            tools=[Tool(type="function", function=ToolFunction(
+                name="mcp__server.tool", description="d", parameters={"type": "object", "properties": {}}
+            ))],
+        )
+        with pytest.raises(ValueError) as exc_info:
+            self._tools_payload(request)
+        print(f"Error: {str(exc_info.value)[:120]}")
+        assert "mcp__server.tool" in str(exc_info.value)
+
+    def test_valid_tools_unchanged(self):
+        """
+        What it does: Verifies valid tools are emitted verbatim.
+        Purpose: Regression guard against gratuitous mutation of user input.
+        """
+        print("Setup: OpenAI request with a fully valid tool...")
+        schema = {
+            "type": "object",
+            "properties": {"query": {"type": "string", "minLength": 2}},
+            "required": ["query"],
+        }
+        request = ChatCompletionRequest(
+            model="claude-sonnet-4.5",
+            messages=[ChatMessage(role="user", content="Hi")],
+            tools=[Tool(type="function", function=ToolFunction(
+                name="WebSearch", description="Search the web", parameters=schema
+            ))],
+        )
+        tools = self._tools_payload(request)
+        assert tools == [{
+            "toolSpecification": {
+                "name": "WebSearch",
+                "description": "Search the web",
+                "inputSchema": {"json": schema},
+            }
+        }]

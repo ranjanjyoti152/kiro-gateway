@@ -100,6 +100,7 @@ tests/
 │   ├── test_streaming_openai.py    # OpenAI streaming response tests (truncation detection, finish_reason priority, initial_response reuse)
 │   ├── test_thinking_parser.py     # ThinkingParser tests (FSM for thinking blocks)
 │   ├── test_tokenizer.py           # Tokenizer tests (tiktoken)
+│   ├── test_tool_sanitizer.py      # Kiro tool spec sanitizer tests (name rules, schema rules, description/schema repairs, duplicates)
 │   ├── test_truncation_recovery.py # Truncation Recovery System tests (synthetic message generation)
 │   ├── test_truncation_state.py    # Truncation state cache tests (save/retrieve, one-time retrieval, thread safety)
 │   └── test_vpn_proxy.py           # VPN/Proxy configuration tests (environment variables, URL normalization, NO_PROXY)
