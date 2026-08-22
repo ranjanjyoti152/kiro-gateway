@@ -341,6 +341,98 @@ class TestAwsSsoOidcUrlConfig:
             assert url == expected
 
 
+class TestManagementHostConfig:
+    """Tests for the management host used by live model discovery."""
+    
+    def test_management_host_template_exists(self):
+        """
+        What it does: Verifies that KIRO_MANAGEMENT_HOST_TEMPLATE exists.
+        Purpose: Ensure the management host is region-templated like the other hosts.
+        """
+        print("Setup: Importing config module...")
+        import importlib
+        import kiro.config as config_module
+        importlib.reload(config_module)
+        
+        print(f"Template: {config_module.KIRO_MANAGEMENT_HOST_TEMPLATE}")
+        assert hasattr(config_module, 'KIRO_MANAGEMENT_HOST_TEMPLATE')
+        assert "management" in config_module.KIRO_MANAGEMENT_HOST_TEMPLATE
+        assert "kiro.dev" in config_module.KIRO_MANAGEMENT_HOST_TEMPLATE
+        assert "{region}" in config_module.KIRO_MANAGEMENT_HOST_TEMPLATE
+    
+    def test_get_kiro_management_host_default_region(self):
+        """
+        What it does: Verifies the management host for the default region.
+        Purpose: us-east-1 is the default region for all installations.
+        """
+        print("Setup: Importing get_kiro_management_host...")
+        from kiro.config import get_kiro_management_host, REGION
+        
+        url = get_kiro_management_host(REGION)
+        print(f"Default region {REGION} → {url}")
+        
+        assert url == f"https://management.{REGION}.kiro.dev"
+    
+    def test_get_kiro_management_host_multiple_regions(self):
+        """
+        What it does: Verifies management host generation for several regions.
+        Purpose: Both us-east-1 and eu-central-1 appear in Kiro IDE.
+        """
+        print("Setup: Importing get_kiro_management_host...")
+        from kiro.config import get_kiro_management_host
+        
+        test_cases = [
+            ("us-east-1", "https://management.us-east-1.kiro.dev"),
+            ("eu-central-1", "https://management.eu-central-1.kiro.dev"),
+            ("ap-southeast-1", "https://management.ap-southeast-1.kiro.dev"),
+            ("us-west-2", "https://management.us-west-2.kiro.dev"),
+        ]
+        
+        for region, expected in test_cases:
+            url = get_kiro_management_host(region)
+            print(f"Comparing: Expected '{expected}', Got '{url}'")
+            assert url == expected
+    
+    def test_management_host_differs_from_runtime_host(self):
+        """
+        What it does: Verifies management and runtime hosts are different.
+        Purpose: The runtime host answers 404 for /ListAvailableModels.
+        """
+        print("Setup: Importing host helpers...")
+        from kiro.config import get_kiro_api_host, get_kiro_management_host, get_kiro_q_host
+        
+        management = get_kiro_management_host("us-east-1")
+        api = get_kiro_api_host("us-east-1")
+        q = get_kiro_q_host("us-east-1")
+        
+        print(f"management={management}, api={api}, q={q}")
+        assert management != api
+        assert management != q
+        assert management.startswith("https://management.")
+    
+    def test_model_discovery_constants(self):
+        """
+        What it does: Verifies model discovery constants are sane.
+        Purpose: origin is mandatory upstream and the page cap must be positive.
+        """
+        print("Setup: Importing discovery constants...")
+        from kiro.config import (
+            MODEL_DISCOVERY_MAX_PAGES,
+            MODEL_DISCOVERY_ORIGIN,
+            MODEL_DISCOVERY_PATH,
+            MODEL_DISCOVERY_TIMEOUT,
+        )
+        
+        print(f"origin={MODEL_DISCOVERY_ORIGIN}, path={MODEL_DISCOVERY_PATH}")
+        print(f"max_pages={MODEL_DISCOVERY_MAX_PAGES}, timeout={MODEL_DISCOVERY_TIMEOUT}")
+        
+        assert MODEL_DISCOVERY_ORIGIN == "AI_EDITOR"
+        assert MODEL_DISCOVERY_PATH == "/ListAvailableModels"
+        assert isinstance(MODEL_DISCOVERY_MAX_PAGES, int)
+        assert MODEL_DISCOVERY_MAX_PAGES >= 1
+        assert MODEL_DISCOVERY_TIMEOUT > 0
+
+
 class TestServerHostConfig:
     """Tests for SERVER_HOST configuration."""
     

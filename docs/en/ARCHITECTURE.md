@@ -241,6 +241,7 @@ token = await auth_manager.get_access_token()
 
 **Population Strategy:** 
 - Lazy Loading via `/ListAvailableModels`
+- Live discovery from the management host for runtime-endpoint accounts (`kiro/model_discovery.py`)
 - Cache TTL: 1 hour
 - Fallback to static model list
 
@@ -458,7 +459,9 @@ prompt_tokens = total_tokens - completion_tokens             (subtraction)
 All URLs are dynamically formed based on the region:
 
 *   **Token Refresh:** `POST https://prod.{region}.auth.desktop.kiro.dev/refreshToken`
-*   **List Models:** `GET https://q.{region}.amazonaws.com/ListAvailableModels`
+*   **List Models (legacy endpoint):** `GET https://q.{region}.amazonaws.com/ListAvailableModels`
+*   **List Models (runtime endpoint):** `GET https://management.{region}.kiro.dev/ListAvailableModels?origin=AI_EDITOR&profileArn=...`
+    The runtime host answers this operation with HTTP 404 `UnknownOperationException`, so discovery targets the management host (the same call Kiro IDE makes). On any failure the static model list is used.
 *   **Generate Response:** `POST https://codewhisperer.{region}.amazonaws.com/generateAssistantResponse`
 
 ## 4. Detailed Data Flow

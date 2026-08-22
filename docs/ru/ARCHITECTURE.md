@@ -241,6 +241,7 @@ token = await auth_manager.get_access_token()
 
 **Стратегия Заполнения:** 
 - Lazy Loading через `/ListAvailableModels`
+- Живое обнаружение моделей через management-хост для аккаунтов на runtime-эндпоинте (`kiro/model_discovery.py`)
 - TTL кэша: 1 час
 - Fallback на статический список моделей
 
@@ -458,7 +459,9 @@ prompt_tokens = total_tokens - completion_tokens            (вычитание)
 Все URL динамически формируются на основе региона:
 
 *   **Token Refresh:** `POST https://prod.{region}.auth.desktop.kiro.dev/refreshToken`
-*   **List Models:** `GET https://q.{region}.amazonaws.com/ListAvailableModels`
+*   **List Models (legacy эндпоинт):** `GET https://q.{region}.amazonaws.com/ListAvailableModels`
+*   **List Models (runtime эндпоинт):** `GET https://management.{region}.kiro.dev/ListAvailableModels?origin=AI_EDITOR&profileArn=...`
+    Runtime-хост отвечает на эту операцию HTTP 404 `UnknownOperationException`, поэтому обнаружение моделей идёт на management-хост (тот же запрос делает Kiro IDE). При любой ошибке используется статический список моделей.
 *   **Generate Response:** `POST https://codewhisperer.{region}.amazonaws.com/generateAssistantResponse`
 
 ## 4. Детальный Поток Данных

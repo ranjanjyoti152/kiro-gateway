@@ -184,6 +184,15 @@ KIRO_API_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 # Host for Q API (ListAvailableModels)
 KIRO_Q_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 
+# Host for management API (ListAvailableModels on the new runtime stack)
+#
+# The runtime host (runtime.{region}.kiro.dev) answers /ListAvailableModels with
+# HTTP 404 <UnknownOperationException> - that operation lives on the management
+# host instead. Kiro IDE itself calls GET {management_host}/ListAvailableModels
+# with the "origin" query parameter, so the gateway uses the same endpoint to
+# discover the real model list of an account.
+KIRO_MANAGEMENT_HOST_TEMPLATE: str = "https://management.{region}.kiro.dev"
+
 # ==================================================================================================
 # Token Settings
 # ==================================================================================================
@@ -298,6 +307,25 @@ MODEL_CACHE_TTL: int = 3600
 
 # Default maximum number of input tokens
 DEFAULT_MAX_INPUT_TOKENS: int = 200000
+
+# ==================================================================================================
+# Live Model Discovery Settings (management endpoint)
+# ==================================================================================================
+
+# Query parameter value required by /ListAvailableModels ("origin" is mandatory).
+# Kiro IDE sends AI_EDITOR, so the gateway does the same to get the same list.
+MODEL_DISCOVERY_ORIGIN: str = "AI_EDITOR"
+
+# Request path of the model discovery operation (AWS restJson1 protocol).
+MODEL_DISCOVERY_PATH: str = "/ListAvailableModels"
+
+# Maximum number of pages fetched while following nextToken.
+# Guard against a server that keeps returning a nextToken forever.
+MODEL_DISCOVERY_MAX_PAGES: int = int(os.getenv("MODEL_DISCOVERY_MAX_PAGES", "10"))
+
+# HTTP timeout (seconds) for a single model discovery request.
+# Discovery happens at startup, so it must fail fast instead of blocking boot.
+MODEL_DISCOVERY_TIMEOUT: float = float(os.getenv("MODEL_DISCOVERY_TIMEOUT", "15"))
 
 # ==================================================================================================
 # Tool Description Handling (Kiro API Limitations)
@@ -578,4 +606,27 @@ def get_kiro_api_host(region: str) -> str:
 def get_kiro_q_host(region: str) -> str:
     """Return Q API host for the specified region."""
     return KIRO_Q_HOST_TEMPLATE.format(region=region)
+
+
+def get_kiro_management_host(region: str) -> str:
+    """
+    Return management API host for the specified region.
+
+    The management host serves /ListAvailableModels for accounts that talk to
+    the runtime host (runtime.{region}.kiro.dev), which does not implement that
+    operation.
+
+    Args:
+        region: AWS region used for the Q Developer API (e.g. "us-east-1")
+
+    Returns:
+        Fully qualified management host URL without trailing slash
+
+    Examples:
+        >>> get_kiro_management_host("us-east-1")
+        'https://management.us-east-1.kiro.dev'
+        >>> get_kiro_management_host("eu-central-1")
+        'https://management.eu-central-1.kiro.dev'
+    """
+    return KIRO_MANAGEMENT_HOST_TEMPLATE.format(region=region)
 

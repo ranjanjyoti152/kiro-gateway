@@ -18,6 +18,9 @@ import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
+import httpx
+
+from kiro.config import FALLBACK_MODELS
 from kiro.account_manager import (
     Account,
     AccountStats,
@@ -1300,3 +1303,586 @@ class TestFormatDuration:
         """Test formatting days."""
         assert _format_duration(86400) == "1d"
         assert _format_duration(172800) == "2d"
+
+
+# =============================================================================
+# Live model discovery wiring (management endpoint)
+# =============================================================================
+
+# Real model IDs returned by management.{region}.kiro.dev/ListAvailableModels
+DISCOVERED_MODEL_IDS = [
+    "auto",
+    "claude-sonnet-5",
+    "claude-opus-4.8",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "claude-opus-4.7",
+    "claude-opus-4.6",
+    "claude-sonnet-4.6",
+    "claude-opus-4.5",
+    "claude-sonnet-4.5",
+    "claude-sonnet-4",
+    "claude-haiku-4.5",
+    "deepseek-3.2",
+    "minimax-m2.5",
+    "minimax-m2.1",
+    "glm-5",
+    "qwen3-coder-next",
+]
+
+
+def _discovery_body(model_ids):
+    """
+    Build a /ListAvailableModels response body in the real upstream shape.
+
+    Args:
+        model_ids: Model IDs to include
+
+    Returns:
+        Response body dictionary
+    """
+    return {
+        "models": [
+            {
+                "description": f"Description of {model_id}",
+                "modelId": model_id,
+                "modelName": model_id,
+                "promptCaching": {"supportsPromptCaching": True},
+                "rateMultiplier": 1.0,
+                "rateUnit": "Credit",
+                "supportedInputTypes": ["TEXT"],
+            }
+            for model_id in model_ids
+        ]
+    }
+
+
+class FakeDiscoveryClient:
+    """
+    Minimal stand-in for httpx.AsyncClient used by model discovery.
+
+    Records real httpx.Request objects so query and header assembly is still
+    performed by httpx, while no traffic ever leaves the process.
+
+    Attributes:
+        requests: Every request issued, in order
+        closed: True once aclose() was awaited
+    """
+
+    def __init__(self, responder):
+        """
+        Initialize the fake client.
+
+        Args:
+            responder: Callable receiving (request, index) that returns an
+                httpx.Response or raises to simulate a transport failure
+        """
+        self.requests = []
+        self.closed = False
+        self._responder = responder
+
+    async def get(self, url, params=None, headers=None):
+        """Record the request and return the configured response."""
+        request = httpx.Request("GET", url, params=params, headers=headers)
+        index = len(self.requests)
+        self.requests.append(request)
+
+        response = self._responder(request, index)
+        response.request = request
+        return response
+
+    async def aclose(self):
+        """Mark the client as closed."""
+        self.closed = True
+
+
+def _make_runtime_account(tmp_path, region="us-east-1"):
+    """
+    Create an AccountManager with one JSON account on the runtime endpoint.
+
+    Args:
+        tmp_path: pytest temporary directory
+        region: Region stored in the credentials file
+
+    Returns:
+        Tuple of (manager, account_id)
+    """
+    test_json = tmp_path / "runtime_account.json"
+    test_json.write_text(json.dumps({
+        "refreshToken": "discovery_refresh",
+        "accessToken": "discovery_access",
+        "expiresAt": "2099-01-01T00:00:00.000Z",
+        "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/DISCOVERY",
+        "region": region
+    }))
+
+    creds_file = tmp_path / "credentials.json"
+    creds_file.write_text(json.dumps([
+        {"type": "json", "path": str(test_json), "enabled": True}
+    ]))
+
+    manager = AccountManager(
+        credentials_file=str(creds_file),
+        state_file=str(tmp_path / "state.json")
+    )
+
+    return manager, str(test_json.resolve())
+
+
+class TestAccountManagerModelDiscovery:
+    """
+    Tests for live model discovery wiring in AccountManager.
+
+    Runtime-endpoint accounts must discover their real model list from the
+    management host and degrade to FALLBACK_MODELS without breaking startup.
+    """
+
+    @pytest.mark.asyncio
+    async def test_runtime_account_discovers_real_model_list(self, tmp_path):
+        """
+        Test that a runtime-endpoint account gets the discovered model list.
+
+        What it does: Initializes an account with a mocked management response
+        Purpose: Verify the 18 real models replace the 13-model static fallback
+        """
+        print("\n=== Test: runtime account discovers real model list ===")
+
+        manager, account_id = _make_runtime_account(tmp_path)
+        await manager.load_credentials()
+
+        fake_client = FakeDiscoveryClient(
+            lambda request, index: httpx.Response(
+                200, json=_discovery_body(DISCOVERED_MODEL_IDS)
+            )
+        )
+
+        with patch("kiro.model_discovery.httpx.AsyncClient", return_value=fake_client):
+            success = await manager._initialize_account(account_id)
+
+        account = manager._accounts[account_id]
+        cached_ids = account.model_cache.get_all_model_ids()
+        print(f"Success: {success}, cached models: {len(cached_ids)}")
+
+        assert success is True
+        assert sorted(cached_ids) == sorted(DISCOVERED_MODEL_IDS)
+
+        for new_model in ("gpt-5.6-sol", "claude-sonnet-5", "claude-opus-4.8"):
+            print(f"Checking {new_model} is valid...")
+            assert account.model_cache.is_valid_model(new_model) is True
+
+        assert fake_client.closed is True
+
+    @pytest.mark.asyncio
+    async def test_discovery_request_targets_management_host(self, tmp_path):
+        """
+        Test the outgoing discovery request shape.
+
+        What it does: Inspects the recorded request from account initialization
+        Purpose: Lock the verified endpoint contract (GET, origin, profileArn)
+        """
+        print("\n=== Test: discovery request targets management host ===")
+
+        manager, account_id = _make_runtime_account(tmp_path)
+        await manager.load_credentials()
+
+        fake_client = FakeDiscoveryClient(
+            lambda request, index: httpx.Response(200, json=_discovery_body(["auto"]))
+        )
+
+        with patch("kiro.model_discovery.httpx.AsyncClient", return_value=fake_client):
+            await manager._initialize_account(account_id)
+
+        assert len(fake_client.requests) == 1
+        request = fake_client.requests[0]
+        print(f"{request.method} {request.url}")
+
+        assert request.method == "GET"
+        assert request.url.host == "management.us-east-1.kiro.dev"
+        assert request.url.path == "/ListAvailableModels"
+        assert request.url.params["origin"] == "AI_EDITOR"
+        assert request.url.params["profileArn"].startswith("arn:aws:codewhisperer:")
+        assert request.headers["content-type"] == "application/json"
+        assert "x-amz-target" not in request.headers
+        assert "KiroIDE" in request.headers["user-agent"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [403, 404, 500])
+    async def test_http_failure_falls_back_to_static_models(self, tmp_path, status_code):
+        """
+        Test fallback to FALLBACK_MODELS on HTTP errors.
+
+        What it does: Returns an error status from the management host
+        Purpose: Startup must never break because of model discovery
+        """
+        print(f"\n=== Test: HTTP {status_code} falls back to static models ===")
+
+        manager, account_id = _make_runtime_account(tmp_path)
+        await manager.load_credentials()
+
+        fake_client = FakeDiscoveryClient(
+            lambda request, index: httpx.Response(status_code, json={"message": "error"})
+        )
+
+        with patch("kiro.model_discovery.httpx.AsyncClient", return_value=fake_client):
+            success = await manager._initialize_account(account_id)
+
+        account = manager._accounts[account_id]
+        cached_ids = sorted(account.model_cache.get_all_model_ids())
+        expected_ids = sorted(m["modelId"] for m in FALLBACK_MODELS)
+        print(f"Success: {success}, cached: {len(cached_ids)} models")
+
+        assert success is True
+        assert cached_ids == expected_ids
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "exception_factory",
+        [
+            lambda request: httpx.ReadTimeout("slow", request=request),
+            lambda request: httpx.ConnectError("dns", request=request),
+        ],
+        ids=["timeout", "network_error"],
+    )
+    async def test_transport_failure_falls_back_to_static_models(
+        self, tmp_path, exception_factory
+    ):
+        """
+        Test fallback on timeouts and network errors.
+
+        What it does: Raises transport errors from the fake client
+        Purpose: Offline or blocked networks must still start the gateway
+        """
+        print("\n=== Test: transport failure falls back to static models ===")
+
+        def responder(request, index):
+            raise exception_factory(request)
+
+        manager, account_id = _make_runtime_account(tmp_path)
+        await manager.load_credentials()
+
+        fake_client = FakeDiscoveryClient(responder)
+
+        with patch("kiro.model_discovery.httpx.AsyncClient", return_value=fake_client):
+            success = await manager._initialize_account(account_id)
+
+        account = manager._accounts[account_id]
+        print(f"Success: {success}, cached: {account.model_cache.size} models")
+
+        assert success is True
+        assert account.model_cache.size == len(FALLBACK_MODELS)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "body,raw",
+        [
+            (None, "<html>not json</html>"),
+            ({"other": "field"}, None),
+            ({"models": []}, None),
+            ({"models": [{"modelName": "no id"}]}, None),
+        ],
+        ids=["malformed_json", "models_missing", "models_empty", "entries_without_id"],
+    )
+    async def test_unusable_body_falls_back_to_static_models(self, tmp_path, body, raw):
+        """
+        Test fallback when the response body carries no usable models.
+
+        What it does: Returns malformed or empty bodies from the management host
+        Purpose: Clients must never see an empty model list
+        """
+        print("\n=== Test: unusable body falls back to static models ===")
+
+        def responder(request, index):
+            if raw is not None:
+                return httpx.Response(200, text=raw)
+            return httpx.Response(200, json=body)
+
+        manager, account_id = _make_runtime_account(tmp_path)
+        await manager.load_credentials()
+
+        fake_client = FakeDiscoveryClient(responder)
+
+        with patch("kiro.model_discovery.httpx.AsyncClient", return_value=fake_client):
+            success = await manager._initialize_account(account_id)
+
+        account = manager._accounts[account_id]
+        print(f"Success: {success}, cached: {account.model_cache.size} models")
+
+        assert success is True
+        assert account.model_cache.size == len(FALLBACK_MODELS)
+
+    @pytest.mark.asyncio
+    async def test_discovery_paginates_across_pages(self, tmp_path):
+        """
+        Test that paginated discovery results are merged during initialization.
+
+        What it does: Serves two pages joined by nextToken
+        Purpose: A truncated list would hide models from clients
+        """
+        print("\n=== Test: discovery paginates across pages ===")
+
+        page_one = _discovery_body(DISCOVERED_MODEL_IDS[:9])
+        page_one["nextToken"] = "page-2"
+        page_two = _discovery_body(DISCOVERED_MODEL_IDS[9:])
+
+        def responder(request, index):
+            return httpx.Response(200, json=page_one if index == 0 else page_two)
+
+        manager, account_id = _make_runtime_account(tmp_path)
+        await manager.load_credentials()
+
+        fake_client = FakeDiscoveryClient(responder)
+
+        with patch("kiro.model_discovery.httpx.AsyncClient", return_value=fake_client):
+            await manager._initialize_account(account_id)
+
+        account = manager._accounts[account_id]
+        print(f"Requests: {len(fake_client.requests)}, cached: {account.model_cache.size}")
+
+        assert len(fake_client.requests) == 2
+        assert account.model_cache.size == len(DISCOVERED_MODEL_IDS)
+
+    @pytest.mark.asyncio
+    async def test_non_runtime_endpoint_keeps_existing_behavior(
+        self, tmp_path, mock_list_models_response
+    ):
+        """
+        Test that non-runtime accounts still use the q host path.
+
+        What it does: Forces _is_runtime_endpoint to False
+        Purpose: The legacy endpoint behavior must not regress
+        """
+        print("\n=== Test: non-runtime endpoint keeps existing behavior ===")
+
+        manager, account_id = _make_runtime_account(tmp_path)
+        await manager.load_credentials()
+
+        with patch("kiro.account_manager._is_runtime_endpoint", return_value=False), \
+             patch("kiro.account_manager.discover_models_with_fallback") as mock_discovery, \
+             patch("kiro.account_manager.KiroHttpClient") as mock_http_class:
+            mock_client = AsyncMock()
+            mock_response = Mock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = mock_list_models_response
+            mock_client.request_with_retry = AsyncMock(return_value=mock_response)
+            mock_client.close = AsyncMock()
+            mock_http_class.return_value = mock_client
+
+            success = await manager._initialize_account(account_id)
+
+        account = manager._accounts[account_id]
+        cached_ids = sorted(account.model_cache.get_all_model_ids())
+        print(f"Success: {success}, cached: {cached_ids}")
+
+        assert success is True
+        assert mock_discovery.called is False
+        assert mock_client.request_with_retry.await_count == 1
+        assert cached_ids == sorted(m["modelId"] for m in mock_list_models_response["models"])
+
+    @pytest.mark.asyncio
+    async def test_discovered_models_flow_to_both_api_surfaces(self, tmp_path):
+        """
+        Test that discovered models reach the resolver and the aggregate list.
+
+        What it does: Reads ModelResolver.get_available_models() and
+            AccountManager.get_all_available_models() after discovery
+        Purpose: /v1/models (OpenAI) and the Anthropic surface share this data
+        """
+        print("\n=== Test: discovered models flow to both API surfaces ===")
+
+        manager, account_id = _make_runtime_account(tmp_path)
+        await manager.load_credentials()
+
+        fake_client = FakeDiscoveryClient(
+            lambda request, index: httpx.Response(
+                200, json=_discovery_body(DISCOVERED_MODEL_IDS)
+            )
+        )
+
+        with patch("kiro.model_discovery.httpx.AsyncClient", return_value=fake_client):
+            await manager._initialize_account(account_id)
+
+        account = manager._accounts[account_id]
+        resolver_models = account.model_resolver.get_available_models()
+        aggregate_models = manager.get_all_available_models()
+
+        print(f"Resolver models: {resolver_models}")
+        print(f"Aggregate models: {aggregate_models}")
+
+        for model_id in ("gpt-5.6-sol", "claude-sonnet-5", "claude-opus-4.8", "glm-5"):
+            assert model_id in resolver_models
+            assert model_id in aggregate_models
+
+        # Both surfaces resolve the new models through the same cache
+        resolution = account.model_resolver.resolve("claude-sonnet-5")
+        print(f"Resolution: {resolution}")
+        assert resolution.internal_id == "claude-sonnet-5"
+        assert resolution.source == "cache"
+        assert resolution.is_verified is True
+
+    @pytest.mark.asyncio
+    async def test_presentation_keeps_auto_kiro_alias_and_hides_auto(self, tmp_path):
+        """
+        Test that model list presentation is unchanged after discovery.
+
+        What it does: Checks the exposed model list for auto / auto-kiro
+        Purpose: /v1/models must keep showing the alias, not the bare "auto"
+        """
+        print("\n=== Test: presentation keeps auto-kiro and hides auto ===")
+
+        manager, account_id = _make_runtime_account(tmp_path)
+        await manager.load_credentials()
+
+        fake_client = FakeDiscoveryClient(
+            lambda request, index: httpx.Response(
+                200, json=_discovery_body(DISCOVERED_MODEL_IDS)
+            )
+        )
+
+        with patch("kiro.model_discovery.httpx.AsyncClient", return_value=fake_client):
+            await manager._initialize_account(account_id)
+
+        account = manager._accounts[account_id]
+        exposed = account.model_resolver.get_available_models()
+        aggregate = manager.get_all_available_models()
+
+        print(f"Exposed models: {exposed}")
+        assert "auto-kiro" in exposed
+        assert "auto" not in exposed
+        assert "auto-kiro" in aggregate
+        assert "auto" not in aggregate
+
+        # "auto" still works when requested explicitly (hidden, not removed)
+        assert account.model_cache.is_valid_model("auto") is True
+        assert account.model_resolver.resolve("auto-kiro").internal_id == "auto"
+
+    @pytest.mark.asyncio
+    async def test_ttl_refresh_uses_management_discovery(self, tmp_path):
+        """
+        Test that the TTL refresh path also discovers live models.
+
+        What it does: Initializes with a small list, then refreshes with a larger one
+        Purpose: New models must appear without restarting the gateway
+        """
+        print("\n=== Test: TTL refresh uses management discovery ===")
+
+        manager, account_id = _make_runtime_account(tmp_path)
+        await manager.load_credentials()
+
+        initial_client = FakeDiscoveryClient(
+            lambda request, index: httpx.Response(200, json=_discovery_body(["auto", "glm-5"]))
+        )
+        with patch("kiro.model_discovery.httpx.AsyncClient", return_value=initial_client):
+            await manager._initialize_account(account_id)
+
+        account = manager._accounts[account_id]
+        print(f"Cached after init: {account.model_cache.size}")
+        assert account.model_cache.size == 2
+
+        refresh_client = FakeDiscoveryClient(
+            lambda request, index: httpx.Response(
+                200, json=_discovery_body(DISCOVERED_MODEL_IDS)
+            )
+        )
+        with patch("kiro.model_discovery.httpx.AsyncClient", return_value=refresh_client):
+            await manager._refresh_account_models(account_id)
+
+        print(f"Cached after refresh: {account.model_cache.size}")
+        assert account.model_cache.size == len(DISCOVERED_MODEL_IDS)
+        assert account.model_cache.is_valid_model("gpt-5.6-sol") is True
+        assert "gpt-5.6-sol" in manager._model_to_accounts
+
+    @pytest.mark.asyncio
+    async def test_ttl_refresh_keeps_richer_cache_when_discovery_fails(self, tmp_path):
+        """
+        Test that a failed refresh does not downgrade a richer cache.
+
+        What it does: Refreshes after a successful discovery, but with a failing endpoint
+        Purpose: A temporary outage must not remove models clients already use
+        """
+        print("\n=== Test: failed refresh keeps richer cache ===")
+
+        manager, account_id = _make_runtime_account(tmp_path)
+        await manager.load_credentials()
+
+        initial_client = FakeDiscoveryClient(
+            lambda request, index: httpx.Response(
+                200, json=_discovery_body(DISCOVERED_MODEL_IDS)
+            )
+        )
+        with patch("kiro.model_discovery.httpx.AsyncClient", return_value=initial_client):
+            await manager._initialize_account(account_id)
+
+        account = manager._accounts[account_id]
+        assert account.model_cache.size == len(DISCOVERED_MODEL_IDS)
+
+        failing_client = FakeDiscoveryClient(
+            lambda request, index: httpx.Response(500, json={"message": "error"})
+        )
+        with patch("kiro.model_discovery.httpx.AsyncClient", return_value=failing_client):
+            await manager._refresh_account_models(account_id)
+
+        print(f"Cached after failed refresh: {account.model_cache.size}")
+        assert account.model_cache.size == len(DISCOVERED_MODEL_IDS)
+        assert account.model_cache.is_valid_model("claude-sonnet-5") is True
+
+    @pytest.mark.asyncio
+    async def test_ttl_refresh_falls_back_when_cache_is_not_richer(self, tmp_path):
+        """
+        Test that a failed refresh still yields the static list for a small cache.
+
+        What it does: Starts with 2 discovered models, then fails the refresh
+        Purpose: Keep the documented safety net when nothing better is cached
+        """
+        print("\n=== Test: failed refresh falls back for small cache ===")
+
+        manager, account_id = _make_runtime_account(tmp_path)
+        await manager.load_credentials()
+
+        initial_client = FakeDiscoveryClient(
+            lambda request, index: httpx.Response(200, json=_discovery_body(["auto", "glm-5"]))
+        )
+        with patch("kiro.model_discovery.httpx.AsyncClient", return_value=initial_client):
+            await manager._initialize_account(account_id)
+
+        account = manager._accounts[account_id]
+        assert account.model_cache.size == 2
+
+        failing_client = FakeDiscoveryClient(
+            lambda request, index: httpx.Response(500, json={"message": "error"})
+        )
+        with patch("kiro.model_discovery.httpx.AsyncClient", return_value=failing_client):
+            await manager._refresh_account_models(account_id)
+
+        cached_ids = sorted(account.model_cache.get_all_model_ids())
+        print(f"Cached after failed refresh: {cached_ids}")
+        assert cached_ids == sorted(m["modelId"] for m in FALLBACK_MODELS)
+
+    @pytest.mark.asyncio
+    async def test_discovered_models_have_usable_token_limits(self, tmp_path):
+        """
+        Test token limit defaults for discovered models.
+
+        What it does: Reads get_max_input_tokens() for every discovered model
+        Purpose: The real payload has no token limit fields - no KeyError / None math
+        """
+        print("\n=== Test: discovered models have usable token limits ===")
+
+        manager, account_id = _make_runtime_account(tmp_path)
+        await manager.load_credentials()
+
+        fake_client = FakeDiscoveryClient(
+            lambda request, index: httpx.Response(
+                200, json=_discovery_body(DISCOVERED_MODEL_IDS)
+            )
+        )
+
+        with patch("kiro.model_discovery.httpx.AsyncClient", return_value=fake_client):
+            await manager._initialize_account(account_id)
+
+        account = manager._accounts[account_id]
+        for model_id in DISCOVERED_MODEL_IDS:
+            max_tokens = account.model_cache.get_max_input_tokens(model_id)
+            print(f"{model_id}: {max_tokens}")
+            assert isinstance(max_tokens, int)
+            assert max_tokens > 0

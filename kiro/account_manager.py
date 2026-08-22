@@ -62,16 +62,25 @@ from kiro.config import (
 from kiro.utils import get_kiro_headers
 from kiro.account_errors import ErrorType
 from kiro.http_client import KiroHttpClient
+from kiro.model_discovery import (
+    SOURCE_MANAGEMENT_ENDPOINT,
+    SOURCE_Q_ENDPOINT,
+    SOURCE_STATIC_FALLBACK,
+    discover_models_with_fallback,
+)
 
 
 def _is_runtime_endpoint(auth_manager: KiroAuthManager) -> bool:
     """
-    Check if auth manager uses runtime endpoint that doesn't provide /ListAvailableModels.
+    Check if auth manager uses the runtime endpoint.
     
     Runtime endpoint pattern: https://runtime.{region}.kiro.dev
     Old endpoint pattern: https://q.{region}.amazonaws.com
     
-    Runtime endpoint does not provide /ListAvailableModels API (AWS limitation).
+    The runtime host itself does not implement /ListAvailableModels (it answers
+    HTTP 404 UnknownOperationException). For those accounts the model list is
+    discovered from the management host instead - see
+    :mod:`kiro.model_discovery`.
     
     Args:
         auth_manager: KiroAuthManager instance
@@ -497,15 +506,25 @@ class AccountManager:
             # Get token to verify credentials
             token = await auth_manager.get_access_token()
             
-            # Determine if we should fetch models or use static list
+            # Determine where the model list comes from
             if _is_runtime_endpoint(auth_manager):
-                # New runtime endpoint does not provide /ListAvailableModels (AWS limitation)
-                # Use static list without attempting request
-                logger.debug(f"Account {account_id}: Using static model list for runtime.kiro.dev endpoint")
-                models_list = FALLBACK_MODELS
+                # The runtime host does not implement /ListAvailableModels, but the
+                # management host does (same operation Kiro IDE calls). Try live
+                # discovery first and fall back to the static list on any failure -
+                # discovery must never break startup.
+                logger.debug(
+                    f"Account {account_id}: discovering models via management host "
+                    f"{auth_manager.management_host}"
+                )
+                models_list, models_source = await discover_models_with_fallback(
+                    auth_manager,
+                    account_label=account_id,
+                    token=token,
+                )
             else:
                 # Old endpoint - attempt to fetch dynamic model list
                 # Fetch models list with retry + fallback
+                models_source = SOURCE_Q_ENDPOINT
                 params = {"origin": "AI_EDITOR"}
                 if auth_manager.auth_type == AuthType.KIRO_DESKTOP and auth_manager.profile_arn:
                     params["profileArn"] = auth_manager.profile_arn
@@ -536,6 +555,7 @@ class AccountManager:
                     logger.error(f"Failed to fetch models for {account_id} after retries: {e}")
                     logger.warning("Using pre-configured fallback models. Models will be refreshed on next TTL cycle when network recovers.")
                     models_list = FALLBACK_MODELS
+                    models_source = SOURCE_STATIC_FALLBACK
                 
                 finally:
                     await http_client.close()
@@ -570,7 +590,11 @@ class AccountManager:
                 if account_id not in self._model_to_accounts[model].accounts:
                     self._model_to_accounts[model].accounts.append(account_id)
             
-            logger.info(f"Initialized account: {account_id} ({len(available_models)} models)")
+            logger.info(
+                f"Initialized account: {account_id} "
+                f"({len(available_models)} models exposed, "
+                f"{len(models_list)} discovered from {models_source})"
+            )
             self._dirty = True
             return True
         
@@ -589,13 +613,48 @@ class AccountManager:
         if not account or not account.auth_manager:
             return
         
-        # Check if using runtime endpoint (no dynamic model list available)
+        # Runtime endpoint: refresh from the management host (same discovery path
+        # used at initialization), falling back to the static list on failure so a
+        # temporary outage never empties the cache.
         if _is_runtime_endpoint(account.auth_manager):
-            # Runtime endpoint does not provide /ListAvailableModels
-            # Use static list and update cache timestamp
-            logger.debug(f"Account {account_id}: Skipping model refresh for runtime.kiro.dev endpoint (using static list)")
-            await account.model_cache.update(FALLBACK_MODELS)
+            models_list, source = await discover_models_with_fallback(
+                account.auth_manager,
+                account_label=account_id,
+            )
+            
+            # Keep the previously cached list when discovery failed and the cache
+            # already holds more models than the static fallback offers.
+            if (
+                source != SOURCE_MANAGEMENT_ENDPOINT
+                and account.model_cache is not None
+                and account.model_cache.size > len(models_list)
+            ):
+                logger.warning(
+                    f"Account {account_id}: keeping the existing model cache "
+                    f"({account.model_cache.size} models) instead of downgrading to "
+                    f"the static list ({len(models_list)} models)"
+                )
+                account.models_cached_at = time.time()
+                self._dirty = True
+                return
+            
+            await account.model_cache.update(models_list)
+            
+            # Re-add hidden models: cache.update() replaces the whole cache
+            for display_name, internal_id in HIDDEN_MODELS.items():
+                account.model_cache.add_hidden_model(display_name, internal_id)
+            
             account.models_cached_at = time.time()
+            
+            # Update model_to_accounts mapping (new models may have appeared)
+            if account.model_resolver:
+                available_models = account.model_resolver.get_available_models()
+                for model in available_models:
+                    if model not in self._model_to_accounts:
+                        self._model_to_accounts[model] = ModelAccountList()
+                    if account_id not in self._model_to_accounts[model].accounts:
+                        self._model_to_accounts[model].accounts.append(account_id)
+            
             self._dirty = True
             return
         

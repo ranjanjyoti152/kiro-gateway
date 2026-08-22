@@ -4251,3 +4251,108 @@ class TestAPIRegionPriorityHierarchy:
         print(f"Result: api_host={manager5._api_host}")
         assert "ap-south-1" in manager5._api_host
 
+
+
+# =============================================================================
+# Management host (live model discovery)
+# =============================================================================
+
+class TestKiroAuthManagerManagementHost:
+    """
+    Tests for the management_host property used by live model discovery.
+    
+    The runtime host does not implement /ListAvailableModels; the management host
+    does. It must follow the same resolved API region as api_host and q_host.
+    """
+    
+    def test_management_host_uses_resolved_api_region(self):
+        """
+        What it does: Verifies management_host follows the per-account api_region.
+        Purpose: Discovery must target the same region as the API calls.
+        """
+        print("Setup: Creating KiroAuthManager with api_region=eu-central-1...")
+        manager = KiroAuthManager(
+            refresh_token="test_token",
+            region="eu-west-1",
+            api_region="eu-central-1"
+        )
+        
+        print(f"management_host: {manager.management_host}")
+        assert manager.management_host == "https://management.eu-central-1.kiro.dev"
+    
+    def test_management_host_matches_api_region_for_us_east_1(self):
+        """
+        What it does: Verifies management_host for us-east-1.
+        Purpose: Default region must resolve to the verified working host.
+        """
+        print("Setup: Creating KiroAuthManager with api_region=us-east-1...")
+        manager = KiroAuthManager(
+            refresh_token="test_token",
+            region="us-east-1",
+            api_region="us-east-1"
+        )
+        
+        print(f"management_host: {manager.management_host}")
+        assert manager.management_host == "https://management.us-east-1.kiro.dev"
+    
+    def test_management_host_falls_back_to_default_region(self, monkeypatch):
+        """
+        What it does: Verifies management_host uses the default region when nothing else is set.
+        Purpose: Installations without overrides must still get a valid host.
+        """
+        print("Setup: Removing KIRO_API_REGION override...")
+        monkeypatch.delenv("KIRO_API_REGION", raising=False)
+        
+        manager = KiroAuthManager(
+            refresh_token="test_token",
+            region="ap-south-1"
+        )
+        
+        print(f"management_host: {manager.management_host}")
+        assert manager.management_host == "https://management.ap-south-1.kiro.dev"
+    
+    def test_management_host_respects_env_override(self, monkeypatch):
+        """
+        What it does: Verifies KIRO_API_REGION also moves the management host.
+        Purpose: The global region override must apply consistently to all hosts.
+        """
+        print("Setup: Setting KIRO_API_REGION=eu-central-1...")
+        monkeypatch.setenv("KIRO_API_REGION", "eu-central-1")
+        
+        manager = KiroAuthManager(
+            refresh_token="test_token",
+            region="us-east-1"
+        )
+        
+        print(f"management_host: {manager.management_host}")
+        print(f"api_host: {manager.api_host}")
+        assert manager.management_host == "https://management.eu-central-1.kiro.dev"
+        assert "eu-central-1" in manager.api_host
+    
+    def test_management_host_region_matches_api_host_region(self, monkeypatch):
+        """
+        What it does: Verifies management_host and api_host always share a region.
+        Purpose: A region mismatch would query another account's model list.
+        """
+        print("Setup: Removing KIRO_API_REGION override...")
+        monkeypatch.delenv("KIRO_API_REGION", raising=False)
+        
+        for region in ("us-east-1", "eu-central-1", "ap-southeast-1"):
+            manager = KiroAuthManager(refresh_token="test_token", region=region)
+            print(f"{region}: api_host={manager.api_host}, management={manager.management_host}")
+            
+            assert region in manager.api_host
+            assert region in manager.q_host
+            assert region in manager.management_host
+    
+    def test_management_host_property_is_read_only(self):
+        """
+        What it does: Verifies management_host is exposed as a read-only property.
+        Purpose: Consistency with the existing api_host / q_host properties.
+        """
+        print("Setup: Creating KiroAuthManager...")
+        manager = KiroAuthManager(refresh_token="test_token", api_region="us-east-1")
+        
+        print("Action: Attempting to assign to management_host...")
+        with pytest.raises(AttributeError):
+            manager.management_host = "https://evil.example.com"

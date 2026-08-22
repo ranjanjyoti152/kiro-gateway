@@ -381,6 +381,129 @@ class TestModelsEndpoint:
             assert model["owned_by"] == "anthropic"
 
 
+class TestModelsEndpointDiscoveredModels:
+    """
+    Tests for /v1/models presentation after live model discovery.
+    
+    Discovery replaces the static 13-model list with the account's real list.
+    The presentation rules (alias exposed, "auto" hidden) must not regress.
+    """
+    
+    # Real model IDs returned by management.{region}.kiro.dev/ListAvailableModels
+    DISCOVERED_MODEL_IDS = [
+        "auto",
+        "claude-sonnet-5",
+        "claude-opus-4.8",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "claude-opus-4.7",
+        "claude-opus-4.6",
+        "claude-sonnet-4.6",
+        "claude-opus-4.5",
+        "claude-sonnet-4.5",
+        "claude-sonnet-4",
+        "claude-haiku-4.5",
+        "deepseek-3.2",
+        "minimax-m2.5",
+        "minimax-m2.1",
+        "glm-5",
+        "qwen3-coder-next",
+    ]
+    
+    def _install_discovered_models(self, test_client) -> None:
+        """
+        Replace the initialized account's cache with a discovered model list.
+        
+        Args:
+            test_client: FastAPI test client whose app state holds the account
+        """
+        import asyncio
+        
+        from kiro.cache import ModelInfoCache
+        from kiro.config import HIDDEN_FROM_LIST, HIDDEN_MODELS, MODEL_ALIASES
+        from kiro.model_resolver import ModelResolver
+        
+        cache = ModelInfoCache()
+        asyncio.run(cache.update([
+            {"modelId": model_id, "modelName": model_id}
+            for model_id in self.DISCOVERED_MODEL_IDS
+        ]))
+        
+        for display_name, internal_id in HIDDEN_MODELS.items():
+            cache.add_hidden_model(display_name, internal_id)
+        
+        resolver = ModelResolver(
+            cache=cache,
+            hidden_models=HIDDEN_MODELS,
+            aliases=MODEL_ALIASES,
+            hidden_from_list=HIDDEN_FROM_LIST
+        )
+        
+        account = test_client.app.state.account_manager.get_first_account()
+        account.model_cache = cache
+        account.model_resolver = resolver
+    
+    def test_models_exposes_discovered_models(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies newly discovered models appear in /v1/models.
+        Purpose: The whole point of live discovery - expose the real model list.
+        """
+        self._install_discovered_models(test_client)
+        
+        print("Action: GET /v1/models after discovery...")
+        response = test_client.get(
+            "/v1/models",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"}
+        )
+        
+        assert response.status_code == 200
+        model_ids = [m["id"] for m in response.json()["data"]]
+        print(f"Model IDs: {model_ids}")
+        
+        for model_id in ("gpt-5.6-sol", "claude-sonnet-5", "claude-opus-4.8", "glm-5"):
+            assert model_id in model_ids
+    
+    def test_models_keeps_auto_kiro_alias_and_hides_auto(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies "auto-kiro" is listed and bare "auto" is not.
+        Purpose: Prevent a presentation regression that would conflict with Cursor.
+        """
+        self._install_discovered_models(test_client)
+        
+        print("Action: GET /v1/models after discovery...")
+        response = test_client.get(
+            "/v1/models",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"}
+        )
+        
+        assert response.status_code == 200
+        model_ids = [m["id"] for m in response.json()["data"]]
+        print(f"Model IDs: {model_ids}")
+        
+        assert "auto-kiro" in model_ids
+        assert "auto" not in model_ids
+    
+    def test_models_list_has_no_duplicates(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies the exposed model list contains no duplicates.
+        Purpose: Duplicate entries break clients that build maps from the list.
+        """
+        self._install_discovered_models(test_client)
+        
+        print("Action: GET /v1/models after discovery...")
+        response = test_client.get(
+            "/v1/models",
+            headers={"Authorization": f"Bearer {valid_proxy_api_key}"}
+        )
+        
+        assert response.status_code == 200
+        model_ids = [m["id"] for m in response.json()["data"]]
+        print(f"Model IDs: {model_ids}")
+        
+        assert len(model_ids) == len(set(model_ids))
+
+
 # =============================================================================
 # Tests for chat completions endpoint (/v1/chat/completions)
 # =============================================================================

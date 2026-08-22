@@ -46,6 +46,7 @@ from kiro.config import (
     get_kiro_refresh_url,
     get_kiro_api_host,
     get_kiro_q_host,
+    get_kiro_management_host,
     get_aws_sso_oidc_url,
 )
 from kiro.utils import get_machine_fingerprint
@@ -98,6 +99,7 @@ class KiroAuthManager:
         region: AWS region
         api_host: API host for the current region
         q_host: Q API host for the current region
+        management_host: Management API host for the current region
         fingerprint: Unique machine fingerprint
         auth_type: Type of authentication (KIRO_DESKTOP or AWS_SSO_OIDC)
     
@@ -221,6 +223,7 @@ class KiroAuthManager:
         self._refresh_url = get_kiro_refresh_url(sso_region_for_oidc)
         self._api_host = get_kiro_api_host(final_api_region)
         self._q_host = get_kiro_q_host(final_api_region)
+        self._management_host = get_kiro_management_host(final_api_region)
         
         # Log initialized endpoints for diagnostics (helps with DNS issues like #58, #132, #133)
         logger.info(
@@ -228,7 +231,8 @@ class KiroAuthManager:
             f"sso_region={sso_region_for_oidc}, "
             f"api_region={final_api_region}, "
             f"api_host={self._api_host}, "
-            f"q_host={self._q_host}"
+            f"q_host={self._q_host}, "
+            f"management_host={self._management_host}"
         )
     
     def _detect_auth_type(self) -> None:
@@ -965,6 +969,17 @@ class KiroAuthManager:
     def q_host(self) -> str:
         """Q API host for the current region."""
         return self._q_host
+    
+    @property
+    def management_host(self) -> str:
+        """
+        Management API host for the current region.
+        
+        Serves /ListAvailableModels for accounts on the runtime host, which does
+        not implement that operation. Uses the same resolved API region as
+        ``api_host`` and ``q_host``.
+        """
+        return self._management_host
     
     @property
     def fingerprint(self) -> str:

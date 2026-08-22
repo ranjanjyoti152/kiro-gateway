@@ -76,7 +76,7 @@ tests/
 │   ├── test_account_manager.py     # AccountManager tests (failover, Circuit Breaker, sticky behavior, state persistence)
 │   ├── test_auth_manager.py        # KiroAuthManager tests (including api_region parameter priority)
 │   ├── test_cache.py               # ModelInfoCache tests (is_valid_model, add_hidden_model)
-│   ├── test_config.py              # Configuration tests (SERVER_HOST, SERVER_PORT, LOG_LEVEL, Account System constants)
+│   ├── test_config.py              # Configuration tests (SERVER_HOST, SERVER_PORT, LOG_LEVEL, management host, Account System constants)
 │   ├── test_converters_anthropic.py # Anthropic Messages API → Kiro converter tests
 │   ├── test_converters_core.py     # Shared conversion logic tests (UnifiedMessage, merging, truncation recovery system prompt)
 │   ├── test_converters_openai.py   # OpenAI Chat API → Kiro converter tests
@@ -88,6 +88,7 @@ tests/
 │   ├── test_main_cli.py            # CLI argument parsing tests (--host, --port)
 │   ├── test_main_lifespan.py       # Application lifespan tests (Account System initialization, legacy migration, background tasks)
 │   ├── test_mcp_tools.py           # MCP Tools tests (WebSearch: ID generation, MCP API calls, SSE emulation, query extraction)
+│   ├── test_model_discovery.py     # Live model discovery tests (management host, pagination, fallback)
 │   ├── test_model_resolver.py      # Dynamic Model Resolution System tests
 │   ├── test_models_anthropic.py    # Anthropic Pydantic models tests (all content blocks, tools, streaming, server-side tools)
 │   ├── test_models_openai.py       # OpenAI Pydantic models tests (messages, tools, responses, streaming)
