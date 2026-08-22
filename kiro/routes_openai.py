@@ -51,7 +51,7 @@ from kiro.profile_resolver import resolve_profile_arn, is_valid_profile_arn
 from kiro.exceptions import MissingProfileArnError, MalformedProfileArnError
 from kiro.streaming_openai import stream_kiro_to_openai, collect_stream_response, stream_with_first_token_retry
 from kiro.http_client import KiroHttpClient
-from kiro.utils import generate_conversation_id
+from kiro.utils import generate_conversation_id, SSE_RESPONSE_HEADERS
 from kiro.config import WEB_SEARCH_ENABLED
 from kiro.mcp_tools import handle_native_web_search
 
@@ -436,7 +436,11 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                                     else:
                                         debug_logger.discard_buffers()
                         
-                        return StreamingResponse(stream_wrapper(), media_type="text/event-stream")
+                        return StreamingResponse(
+                            stream_wrapper(),
+                            media_type="text/event-stream",
+                            headers=SSE_RESPONSE_HEADERS,
+                        )
                     
                     else:
                         # Non-streaming mode
@@ -754,7 +758,11 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                         else:
                             debug_logger.discard_buffers()
             
-            return StreamingResponse(stream_wrapper(), media_type="text/event-stream")
+            return StreamingResponse(
+                stream_wrapper(),
+                media_type="text/event-stream",
+                headers=SSE_RESPONSE_HEADERS,
+            )
         
         else:
             

@@ -41,6 +41,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
 from kiro.tokenizer import count_message_tokens, count_tokens
+from kiro.utils import SSE_RESPONSE_HEADERS
 
 # Import debug_logger
 try:
@@ -670,7 +671,7 @@ async def handle_native_web_search(
         return StreamingResponse(
             sse_generator,
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
+            headers=SSE_RESPONSE_HEADERS,
         )
     else:
         # Non-streaming mode - return full JSON

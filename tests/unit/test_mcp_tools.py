@@ -600,3 +600,67 @@ class TestOpenAISSEEmulation:
         
         print("Checking for usage information...")
         assert any('"usage"' in chunk for chunk in chunks)
+
+
+class TestSSEStreamingHeaders:
+    """
+    Tests that streaming (SSE) responses disable reverse-proxy buffering.
+
+    Without X-Accel-Buffering: no, an nginx-style proxy in front of the gateway
+    buffers the event stream and delivers it to the client in bursts, so tokens
+    appear to arrive in large chunks with pauses instead of smoothly.
+    """
+
+    def test_sse_headers_constant_disables_proxy_buffering(self):
+        """
+        What it does: Verifies the shared SSE header constant.
+        Goal: X-Accel-Buffering: no must be present (plus no-cache/keep-alive).
+        """
+        from kiro.utils import SSE_RESPONSE_HEADERS
+        assert SSE_RESPONSE_HEADERS.get("X-Accel-Buffering") == "no"
+        assert SSE_RESPONSE_HEADERS.get("Cache-Control") == "no-cache"
+        assert SSE_RESPONSE_HEADERS.get("Connection") == "keep-alive"
+
+    @staticmethod
+    def _streaming_request_data():
+        msg = MagicMock()
+        msg.content = "python asyncio tutorial"
+        msg.model_dump.return_value = {"role": "user", "content": "python asyncio tutorial"}
+        request_data = MagicMock()
+        request_data.messages = [msg]
+        request_data.stream = True
+        request_data.model = "claude-sonnet-4.5"
+        return request_data
+
+    @pytest.mark.asyncio
+    async def test_native_web_search_stream_sets_no_buffering_header_anthropic(self, mock_auth_manager):
+        """
+        What it does: Anthropic streaming web_search response carries the
+                      anti-buffering header.
+        Goal: Verify the header is actually wired into the StreamingResponse.
+        """
+        request_data = self._streaming_request_data()
+        with patch(
+            "kiro.mcp_tools.call_kiro_mcp_api",
+            AsyncMock(return_value=("srvtoolu_x", {"results": [], "totalResults": 0})),
+        ):
+            resp = await handle_native_web_search(None, request_data, mock_auth_manager, api_format="anthropic")
+
+        assert resp.headers.get("x-accel-buffering") == "no"
+        assert resp.headers.get("cache-control") == "no-cache"
+
+    @pytest.mark.asyncio
+    async def test_native_web_search_stream_sets_no_buffering_header_openai(self, mock_auth_manager):
+        """
+        What it does: OpenAI streaming web_search response also carries the
+                      anti-buffering header (both API surfaces are consistent).
+        Goal: Verify consistency across API formats.
+        """
+        request_data = self._streaming_request_data()
+        with patch(
+            "kiro.mcp_tools.call_kiro_mcp_api",
+            AsyncMock(return_value=("srvtoolu_x", {"results": [], "totalResults": 0})),
+        ):
+            resp = await handle_native_web_search(None, request_data, mock_auth_manager, api_format="openai")
+
+        assert resp.headers.get("x-accel-buffering") == "no"

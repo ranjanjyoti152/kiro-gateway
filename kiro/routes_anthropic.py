@@ -53,7 +53,7 @@ from kiro.streaming_anthropic import (
     stream_with_first_token_retry_anthropic,
 )
 from kiro.http_client import KiroHttpClient
-from kiro.utils import generate_conversation_id
+from kiro.utils import generate_conversation_id, SSE_RESPONSE_HEADERS
 from kiro.tokenizer import estimate_request_tokens
 from kiro.config import WEB_SEARCH_ENABLED
 from kiro.mcp_tools import handle_native_web_search
@@ -494,10 +494,7 @@ async def messages(
                         return StreamingResponse(
                             stream_wrapper(),
                             media_type="text/event-stream",
-                            headers={
-                                "Cache-Control": "no-cache",
-                                "Connection": "keep-alive",
-                            }
+                            headers=SSE_RESPONSE_HEADERS,
                         )
                     
                     else:
@@ -856,10 +853,7 @@ async def messages(
             return StreamingResponse(
                 stream_wrapper(),
                 media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                }
+                headers=SSE_RESPONSE_HEADERS,
             )
         
         else:

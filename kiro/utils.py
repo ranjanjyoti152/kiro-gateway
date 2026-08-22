@@ -35,6 +35,25 @@ if TYPE_CHECKING:
     from kiro.auth import KiroAuthManager
 
 
+# Headers for Server-Sent Events (SSE) streaming responses.
+#
+# ``X-Accel-Buffering: no`` disables response buffering in reverse proxies
+# (nginx and compatible). Without it, a proxy in front of the gateway buffers
+# the SSE stream and delivers it to the client in bursts, so tokens appear to
+# arrive in large chunks with pauses instead of smoothly. The header is a no-op
+# when no such proxy is present, so it is always safe to send.
+#
+# ``Cache-Control: no-cache`` prevents caching of the event stream and
+# ``Connection: keep-alive`` keeps the connection open for the duration of the
+# stream. These are shared by BOTH API surfaces (OpenAI and Anthropic) and the
+# MCP web_search SSE emulation so streaming behaviour is identical everywhere.
+SSE_RESPONSE_HEADERS: Dict[str, str] = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+
+
 def get_machine_fingerprint() -> str:
     """
     Generates a unique machine fingerprint based on hostname and username.
