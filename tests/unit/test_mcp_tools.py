@@ -180,6 +180,112 @@ class TestCallKiroMCPAPI:
         assert results is None
     
     @pytest.mark.asyncio
+    async def test_mcp_request_includes_profile_arn_at_top_level(self, mock_auth_manager):
+        """
+        What it does: Verifies the MCP request body includes profileArn at the
+                      TOP LEVEL (alongside id/jsonrpc/method), resolved from auth.
+        Purpose: Kiro's /mcp endpoint rejects requests without a top-level
+                 profileArn with HTTP 400 "profileArn is required for this
+                 request." (verified against the live endpoint). This guards
+                 that regression.
+        """
+        print("Setup: Mocking a successful MCP response...")
+        query = "Python tutorials"
+        mock_response_data = {
+            "id": "web_search_tooluse_x",
+            "jsonrpc": "2.0",
+            "result": {"content": [{"type": "text", "text": json.dumps({"results": [], "totalResults": 0})}],
+                       "isError": False},
+        }
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value=mock_response_data)
+
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        print("Action: Calling call_kiro_mcp_api and inspecting the posted body...")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            await call_kiro_mcp_api(query, mock_auth_manager)
+
+        # The request body is passed as the `json=` kwarg to client.post
+        sent_body = mock_post.call_args.kwargs["json"]
+        print(f"Sent MCP body keys: {list(sent_body.keys())}")
+        assert "profileArn" in sent_body, "profileArn must be at the top level of the MCP request"
+        assert sent_body["profileArn"] == mock_auth_manager.profile_arn
+        # Must NOT be nested inside params (Kiro ignores it there)
+        assert "profileArn" not in sent_body["params"]
+
+    @pytest.mark.asyncio
+    async def test_mcp_request_sends_kiro_identity_headers(self, mock_auth_manager):
+        """
+        What it does: Verifies the MCP request carries the KiroIDE client-identity
+                      headers (User-Agent, x-amz-user-agent, x-amzn-kiro-agent-mode)
+                      with Content-Type application/json and no x-amz-target.
+        Purpose: Kiro's /mcp endpoint returns HTTP 403 "User is not authorized to
+                 make this call." when these identity headers are missing (verified
+                 against the live endpoint). This guards that regression.
+        """
+        print("Setup: Mocking a successful MCP response...")
+        query = "test"
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value={
+            "jsonrpc": "2.0",
+            "result": {"content": [{"type": "text", "text": json.dumps({"results": [], "totalResults": 0})}],
+                       "isError": False},
+        })
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        print("Action: Calling call_kiro_mcp_api and inspecting the sent headers...")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            await call_kiro_mcp_api(query, mock_auth_manager)
+
+        sent_headers = mock_post.call_args.kwargs["headers"]
+        print(f"Sent headers: {sorted(sent_headers.keys())}")
+        assert "KiroIDE" in sent_headers.get("User-Agent", "")
+        assert "x-amz-user-agent" in sent_headers
+        assert sent_headers.get("x-amzn-kiro-agent-mode") == "vibe"
+        assert sent_headers.get("Authorization", "").startswith("Bearer ")
+        # JSON-RPC call: correct content type and no streaming-service target
+        assert sent_headers.get("Content-Type") == "application/json"
+        assert "x-amz-target" not in sent_headers
+
+    @pytest.mark.asyncio
+    async def test_mcp_request_omits_profile_arn_and_warns_when_unresolved(self, mock_auth_manager):
+        """
+        What it does: When no profileArn can be resolved, it is not added to the
+                      request and a warning is logged (so the upstream 400 is
+                      expected and explained).
+        Purpose: Verify the graceful degradation path and actionable warning.
+        """
+        print("Setup: Forcing the resolver to return no profileArn...")
+        query = "test"
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value={
+            "jsonrpc": "2.0",
+            "result": {"content": [{"type": "text", "text": json.dumps({"results": [], "totalResults": 0})}],
+                       "isError": False},
+        })
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            with patch("kiro.mcp_tools.resolve_profile_arn", return_value=""):
+                with patch("kiro.mcp_tools.logger") as mock_logger:
+                    await call_kiro_mcp_api(query, mock_auth_manager)
+
+        sent_body = mock_post.call_args.kwargs["json"]
+        assert "profileArn" not in sent_body
+        warned = " ".join(str(c) for c in mock_logger.warning.call_args_list)
+        assert "profileArn" in warned
+
+    @pytest.mark.asyncio
     async def test_mcp_api_http_error(self, mock_auth_manager):
         """
         What it does: Verifies handling of HTTP errors from MCP API.
@@ -190,6 +296,7 @@ class TestCallKiroMCPAPI:
         
         mock_response = Mock()
         mock_response.status_code = 500
+        mock_response.text = "internal error"
         
         mock_post = AsyncMock(return_value=mock_response)
         mock_client = AsyncMock()
@@ -200,6 +307,67 @@ class TestCallKiroMCPAPI:
             tool_use_id, results = await call_kiro_mcp_api(query, mock_auth_manager)
         
         print(f"Comparing result: Expected (None, None), Got ({tool_use_id}, {results})")
+        assert tool_use_id is None
+        assert results is None
+
+    @pytest.mark.asyncio
+    async def test_mcp_api_http_error_logs_response_body(self, mock_auth_manager):
+        """
+        What it does: On a non-200 response (e.g. 400), the upstream response
+                      body is included in the error log.
+        Purpose: The previous behavior logged only "MCP API error: 400" and
+                 discarded Kiro's actual error message, making this class of
+                 failure impossible to diagnose. Verify the body is surfaced.
+        """
+        print("Setup: Mocking HTTP 400 with an explanatory body...")
+        query = "test"
+
+        mock_response = Mock()
+        mock_response.status_code = 400
+        mock_response.text = '{"message":"Improperly formed request: missing profileArn"}'
+
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        print("Action: Calling call_kiro_mcp_api with patched logger...")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            with patch("kiro.mcp_tools.logger") as mock_logger:
+                tool_use_id, results = await call_kiro_mcp_api(query, mock_auth_manager)
+
+        assert tool_use_id is None
+        assert results is None
+
+        # The status code AND the upstream body must appear in an error log line
+        logged = " ".join(str(call) for call in mock_logger.error.call_args_list)
+        print(f"Logged error calls: {logged}")
+        assert "400" in logged
+        assert "missing profileArn" in logged
+
+    @pytest.mark.asyncio
+    async def test_mcp_api_http_error_unreadable_body(self, mock_auth_manager):
+        """
+        What it does: If reading response.text raises, the function still returns
+                      (None, None) and logs a placeholder instead of crashing.
+        Purpose: A logging/diagnostic path must never raise and mask the failure.
+        """
+        print("Setup: Mocking HTTP 400 whose .text raises...")
+        query = "test"
+
+        mock_response = Mock()
+        mock_response.status_code = 400
+        type(mock_response).text = property(
+            lambda self: (_ for _ in ()).throw(RuntimeError("decode failed"))
+        )
+
+        mock_post = AsyncMock(return_value=mock_response)
+        mock_client = AsyncMock()
+        mock_client.__aenter__.return_value.post = mock_post
+
+        print("Action: Calling call_kiro_mcp_api...")
+        with patch("kiro.mcp_tools.httpx.AsyncClient", return_value=mock_client):
+            tool_use_id, results = await call_kiro_mcp_api(query, mock_auth_manager)
+
         assert tool_use_id is None
         assert results is None
     

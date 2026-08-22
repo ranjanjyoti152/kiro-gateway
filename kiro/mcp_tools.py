@@ -41,7 +41,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
 from kiro.tokenizer import count_message_tokens, count_tokens
-from kiro.utils import SSE_RESPONSE_HEADERS
+from kiro.profile_resolver import resolve_profile_arn
+from kiro.utils import get_kiro_headers, SSE_RESPONSE_HEADERS
 
 # Import debug_logger
 try:
@@ -136,6 +137,22 @@ async def call_kiro_mcp_api(
             "arguments": {"query": query}
         }
     }
+
+    # Kiro's /mcp endpoint requires profileArn at the TOP LEVEL of the request
+    # body, exactly like /generateAssistantResponse. Without it the request is
+    # rejected with HTTP 400 "profileArn is required for this request."
+    # Placement matters: profileArn inside "params" is ignored by the upstream
+    # and still yields the 400, so it must sit alongside id/jsonrpc/method.
+    # Resolved via the shared resolver so behaviour matches the main request path.
+    profile_arn = resolve_profile_arn(auth_manager)
+    if profile_arn:
+        mcp_request["profileArn"] = profile_arn
+    else:
+        logger.warning(
+            "No profileArn resolved for MCP web_search; Kiro will reject the "
+            "request with HTTP 400 'profileArn is required'. Set PROFILE_ARN in "
+            ".env or ensure your credentials include a profile ARN."
+        )
     
     # Log MCP request
     try:
@@ -148,12 +165,19 @@ async def call_kiro_mcp_api(
     try:
         token = await auth_manager.get_access_token()
         
-        # EXACT headers from architecture
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "x-amzn-codewhisperer-optout": "false",
-            "Content-Type": "application/json"
-        }
+        # Kiro's /mcp endpoint authorizes based on the KiroIDE client-identity
+        # headers (User-Agent, x-amz-user-agent, x-amzn-kiro-agent-mode, amz-sdk-*).
+        # Sending only Authorization + Content-Type is rejected with HTTP 403
+        # "User is not authorized to make this call." (verified against the live
+        # endpoint: adding these headers turns the 403 into a 200 with results).
+        #
+        # Reuse the shared header builder (single source of truth for Kiro
+        # identity), but this is a JSON-RPC call rather than the streaming
+        # service, so use application/json and drop the GenerateAssistantResponse
+        # x-amz-target.
+        headers = get_kiro_headers(auth_manager, token)
+        headers["Content-Type"] = "application/json"
+        headers.pop("x-amz-target", None)
         
         mcp_url = f"{auth_manager.q_host}/mcp"
         logger.debug(f"Calling MCP API: {mcp_url}")
@@ -162,7 +186,29 @@ async def call_kiro_mcp_api(
             response = await client.post(mcp_url, json=mcp_request, headers=headers)
             
             if response.status_code != 200:
-                logger.error(f"MCP API error: {response.status_code}")
+                # Capture the upstream response body so the actual cause of the
+                # failure is visible. Kiro's MCP endpoint returns a JSON error
+                # describing what it rejected (e.g. malformed params, missing
+                # profileArn, or a plan/entitlement issue). Logging only the
+                # status code made this class of failure impossible to diagnose,
+                # and the [MCP RESPONSE] debug log below is never reached on error.
+                try:
+                    error_body = response.text
+                except Exception:
+                    error_body = "(could not read response body)"
+
+                if debug_logger:
+                    try:
+                        debug_logger.log_raw_chunk(
+                            f"[MCP ERROR HTTP {response.status_code}]\n{error_body}".encode("utf-8")
+                        )
+                    except Exception:
+                        pass
+
+                logger.error(
+                    f"MCP API error: HTTP {response.status_code} from {mcp_url} - "
+                    f"{str(error_body)[:1000]}"
+                )
                 return None, None
             
             mcp_response = response.json()
