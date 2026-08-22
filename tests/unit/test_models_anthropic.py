@@ -22,6 +22,10 @@ from kiro.models_anthropic import (
     ToolUseContentBlock,
     ToolResultContentBlock,
     ToolReferenceContentBlock,
+    # Server-side web_search content blocks
+    WebSearchResultBlock,
+    ServerToolUseContentBlock,
+    WebSearchToolResultContentBlock,
     # Image models
     Base64ImageSource,
     URLImageSource,
@@ -1835,3 +1839,431 @@ class TestAnthropicMessageInlineSystemRole:
         print(f"Result: {len(request.messages)} messages")
         assert request.messages[0].role == "system"
         assert request.messages[1].role == "user"
+
+
+# ==================================================================================================
+# Tests for Server-Side web_search Content Blocks (round-trip 422 fix)
+# ==================================================================================================
+#
+# These tests verify the fix for the production HTTP 422 on POST /v1/messages when the
+# conversation history contains assistant content blocks the gateway itself emitted for
+# web_search (server_tool_use + web_search_tool_result with nested web_search_result items).
+# Before the fix, ContentBlock had no model for these types, so AnthropicMessage.content
+# rejected the whole message before any conversion ran.
+
+
+def _bug_log_web_search_content():
+    """
+    Build the exact assistant content structure from the production 422 bug log.
+
+    Returns:
+        List of raw dict content blocks: text + server_tool_use + web_search_tool_result
+        (with a nested web_search_result item) + a cache_control'd text summary.
+    """
+    return [
+        {"type": "text", "text": "Let me search for that."},
+        {
+            "id": "srvtoolu_fa2b1c3d4e5f6a7b8c9d0e1f",
+            "type": "server_tool_use",
+            "name": "web_search",
+            "input": {"query": "latest python release"},
+        },
+        {
+            "type": "web_search_tool_result",
+            "tool_use_id": "srvtoolu_fa2b1c3d4e5f6a7b8c9d0e1f",
+            "content": [
+                {
+                    "type": "web_search_result",
+                    "title": "Python 3.13 released",
+                    "url": "https://python.org/downloads",
+                    "encrypted_content": "Python 3.13 is now available...",
+                    "page_age": None,
+                }
+            ],
+        },
+        {
+            "type": "text",
+            "text": "\n<web_search>\nSearch results for \"latest python release\":\n\n1. Title: **Python 3.13 released**\n</web_search>\n",
+            "cache_control": {"type": "ephemeral"},
+        },
+    ]
+
+
+class TestWebSearchResultBlock:
+    """Tests for the nested WebSearchResultBlock model."""
+
+    def test_valid_web_search_result(self):
+        """
+        What it does: Verifies creation of a valid WebSearchResultBlock.
+        Purpose: Ensure the nested result item model accepts standard fields.
+        """
+        print("Setup: Creating WebSearchResultBlock with full fields...")
+        block = WebSearchResultBlock(
+            title="Example",
+            url="https://example.com",
+            encrypted_content="opaque",
+            page_age="2 days",
+        )
+
+        print(f"Result: {block}")
+        assert block.type == "web_search_result"
+        assert block.title == "Example"
+        assert block.url == "https://example.com"
+        assert block.encrypted_content == "opaque"
+        assert block.page_age == "2 days"
+
+    def test_type_defaults_to_web_search_result(self):
+        """
+        What it does: Verifies that type defaults to "web_search_result".
+        Purpose: Ensure default discriminator value is set.
+        """
+        print("Setup: Creating WebSearchResultBlock without explicit type...")
+        block = WebSearchResultBlock(title="t")
+
+        print(f"Comparing type: Expected 'web_search_result', Got '{block.type}'")
+        assert block.type == "web_search_result"
+
+    def test_all_fields_optional(self):
+        """
+        What it does: Verifies WebSearchResultBlock accepts empty construction.
+        Purpose: Ensure partial/empty results never trigger a validation error.
+        """
+        print("Setup: Creating WebSearchResultBlock with no fields...")
+        block = WebSearchResultBlock()
+
+        print(f"Result: {block}")
+        assert block.title is None
+        assert block.url is None
+        assert block.encrypted_content is None
+        assert block.page_age is None
+
+    def test_page_age_accepts_null(self):
+        """
+        What it does: Verifies page_age accepts None (as in the bug log).
+        Purpose: Ensure null page_age from the gateway round-trips.
+        """
+        print("Setup: Creating WebSearchResultBlock with page_age=None...")
+        block = WebSearchResultBlock(title="t", url="u", encrypted_content="c", page_age=None)
+
+        print(f"Comparing page_age: Expected None, Got {block.page_age}")
+        assert block.page_age is None
+
+    def test_tolerates_extra_fields(self):
+        """
+        What it does: Verifies unknown fields are tolerated (extra=allow).
+        Purpose: Forward compatibility with evolving web_search schema.
+        """
+        print("Setup: Creating WebSearchResultBlock with an unknown field...")
+        block = WebSearchResultBlock(title="t", favicon="https://example.com/fav.ico")
+
+        print(f"Result: {block}")
+        assert block.title == "t"
+        assert block.model_dump().get("favicon") == "https://example.com/fav.ico"
+
+
+class TestServerToolUseContentBlock:
+    """Tests for the ServerToolUseContentBlock model."""
+
+    def test_valid_server_tool_use(self):
+        """
+        What it does: Verifies creation of a valid ServerToolUseContentBlock.
+        Purpose: Ensure the gateway-emitted server_tool_use block validates.
+        """
+        print("Setup: Creating ServerToolUseContentBlock...")
+        block = ServerToolUseContentBlock(
+            id="srvtoolu_123",
+            name="web_search",
+            input={"query": "python"},
+        )
+
+        print(f"Result: {block}")
+        assert block.type == "server_tool_use"
+        assert block.id == "srvtoolu_123"
+        assert block.name == "web_search"
+        assert block.input == {"query": "python"}
+
+    def test_type_defaults_to_server_tool_use(self):
+        """
+        What it does: Verifies that type defaults to "server_tool_use".
+        Purpose: Ensure default discriminator value is set.
+        """
+        print("Setup: Creating ServerToolUseContentBlock without explicit type...")
+        block = ServerToolUseContentBlock(id="srvtoolu_1", name="web_search", input={})
+
+        print(f"Comparing type: Expected 'server_tool_use', Got '{block.type}'")
+        assert block.type == "server_tool_use"
+
+    def test_requires_id_name_input(self):
+        """
+        What it does: Verifies id, name and input are required.
+        Purpose: Ensure the required fields are enforced.
+        """
+        print("Setup: Attempting to create ServerToolUseContentBlock missing fields...")
+        with pytest.raises(ValidationError) as exc_info:
+            ServerToolUseContentBlock(name="web_search", input={})
+        print(f"ValidationError raised: {exc_info.value}")
+        assert "id" in str(exc_info.value)
+
+    def test_tolerates_extra_fields(self):
+        """
+        What it does: Verifies unknown fields are tolerated (extra=allow).
+        Purpose: Forward compatibility.
+        """
+        print("Setup: Creating ServerToolUseContentBlock with extra field...")
+        block = ServerToolUseContentBlock(
+            id="srvtoolu_1", name="web_search", input={"query": "q"}, cache_control={"type": "ephemeral"}
+        )
+
+        print(f"Result: {block}")
+        assert block.model_dump().get("cache_control") == {"type": "ephemeral"}
+
+
+class TestWebSearchToolResultContentBlock:
+    """Tests for the WebSearchToolResultContentBlock model."""
+
+    def test_valid_with_result_list(self):
+        """
+        What it does: Verifies creation with a list of web_search_result items.
+        Purpose: Ensure the primary (list) form validates.
+        """
+        print("Setup: Creating WebSearchToolResultContentBlock with result list...")
+        block = WebSearchToolResultContentBlock(
+            tool_use_id="srvtoolu_1",
+            content=[
+                {"type": "web_search_result", "title": "t", "url": "u", "encrypted_content": "c", "page_age": None}
+            ],
+        )
+
+        print(f"Result: {block}")
+        assert block.type == "web_search_tool_result"
+        assert block.tool_use_id == "srvtoolu_1"
+        assert len(block.content) == 1
+        assert block.content[0].type == "web_search_result"
+
+    def test_valid_with_string_content(self):
+        """
+        What it does: Verifies content can be a plain string.
+        Purpose: Ensure error-style string content (edge case) validates.
+        """
+        print("Setup: Creating WebSearchToolResultContentBlock with string content...")
+        block = WebSearchToolResultContentBlock(
+            tool_use_id="srvtoolu_1",
+            content="max_uses_exceeded",
+        )
+
+        print(f"Result: {block}")
+        assert block.content == "max_uses_exceeded"
+
+    def test_valid_with_empty_result_list(self):
+        """
+        What it does: Verifies content can be an empty list.
+        Purpose: Ensure a search with zero results round-trips.
+        """
+        print("Setup: Creating WebSearchToolResultContentBlock with empty list...")
+        block = WebSearchToolResultContentBlock(tool_use_id="srvtoolu_1", content=[])
+
+        print(f"Result: {block}")
+        assert block.content == []
+
+    def test_requires_tool_use_id(self):
+        """
+        What it does: Verifies tool_use_id is required.
+        Purpose: Ensure the required field is enforced.
+        """
+        print("Setup: Attempting to create block without tool_use_id...")
+        with pytest.raises(ValidationError) as exc_info:
+            WebSearchToolResultContentBlock(content=[])
+        print(f"ValidationError raised: {exc_info.value}")
+        assert "tool_use_id" in str(exc_info.value)
+
+    def test_result_list_tolerates_extra_fields(self):
+        """
+        What it does: Verifies nested result items tolerate unknown fields.
+        Purpose: Forward compatibility for nested web_search_result items.
+        """
+        print("Setup: Creating block with nested result carrying an extra field...")
+        block = WebSearchToolResultContentBlock(
+            tool_use_id="srvtoolu_1",
+            content=[{"type": "web_search_result", "title": "t", "language": "en"}],
+        )
+
+        print(f"Result: {block}")
+        assert block.content[0].model_dump().get("language") == "en"
+
+
+class TestContentBlockUnionWebSearch:
+    """Tests that ContentBlock union accepts the new server-side web_search blocks."""
+
+    def test_union_accepts_server_tool_use(self):
+        """
+        What it does: Verifies ContentBlock union accepts ServerToolUseContentBlock.
+        Purpose: Ensure the top-level block routes through the union.
+        """
+        print("Setup: Creating ServerToolUseContentBlock as ContentBlock...")
+        block: ContentBlock = ServerToolUseContentBlock(id="srvtoolu_1", name="web_search", input={})
+
+        print(f"Comparing type: Expected 'server_tool_use', Got '{block.type}'")
+        assert block.type == "server_tool_use"
+
+    def test_union_accepts_web_search_tool_result(self):
+        """
+        What it does: Verifies ContentBlock union accepts WebSearchToolResultContentBlock.
+        Purpose: Ensure the top-level block routes through the union.
+        """
+        print("Setup: Creating WebSearchToolResultContentBlock as ContentBlock...")
+        block: ContentBlock = WebSearchToolResultContentBlock(tool_use_id="srvtoolu_1", content=[])
+
+        print(f"Comparing type: Expected 'web_search_tool_result', Got '{block.type}'")
+        assert block.type == "web_search_tool_result"
+
+
+class TestAnthropicMessageWithWebSearchBlocks:
+    """
+    Tests for AnthropicMessage accepting the gateway-emitted web_search blocks.
+
+    These are the PRIMARY tests for the 422 round-trip fix.
+    """
+
+    def test_message_with_web_search_blocks_validates(self):
+        """
+        What it does: Verifies AnthropicMessage accepts an assistant message whose content
+                      list contains server_tool_use and web_search_tool_result blocks.
+        Purpose: PRIMARY test - before the fix this raised a ValidationError (HTTP 422).
+        """
+        print("Setup: Building the exact bug-log assistant content...")
+        message = AnthropicMessage(role="assistant", content=_bug_log_web_search_content())
+
+        print(f"Result: {message}")
+        assert message.role == "assistant"
+        assert len(message.content) == 4
+
+        types = [b.type for b in message.content]
+        print(f"Block types: {types}")
+        assert types == ["text", "server_tool_use", "web_search_tool_result", "text"]
+
+    def test_nested_web_search_result_items_validate(self):
+        """
+        What it does: Verifies nested web_search_result items inside
+                      web_search_tool_result.content are accepted and parsed.
+        Purpose: Ensure the nested structure round-trips.
+        """
+        print("Setup: Building message and inspecting nested results...")
+        message = AnthropicMessage(role="assistant", content=_bug_log_web_search_content())
+
+        result_block = message.content[2]
+        print(f"Result block type: {result_block.type}")
+        assert result_block.type == "web_search_tool_result"
+        assert result_block.content[0].type == "web_search_result"
+        assert result_block.content[0].title == "Python 3.13 released"
+        assert result_block.content[0].page_age is None
+
+    def test_extra_fields_and_cache_control_tolerated(self):
+        """
+        What it does: Verifies unknown fields on the new blocks are tolerated and
+                      cache_control on the text block still validates.
+        Purpose: Forward compatibility + confirm cache_control text blocks pass.
+        """
+        print("Setup: Building message with extra fields on web_search blocks...")
+        content = _bug_log_web_search_content()
+        content[1]["cache_control"] = {"type": "ephemeral"}  # extra field on server_tool_use
+        content[2]["some_future_field"] = "value"  # extra field on web_search_tool_result
+
+        message = AnthropicMessage(role="assistant", content=content)
+
+        print(f"Result: {message}")
+        # server_tool_use extra field preserved
+        assert message.content[1].model_dump().get("cache_control") == {"type": "ephemeral"}
+        # web_search_tool_result extra field preserved
+        assert message.content[2].model_dump().get("some_future_field") == "value"
+        # cache_control on the trailing text block does not break validation
+        assert message.content[3].type == "text"
+
+    def test_web_search_tool_result_string_content_in_message(self):
+        """
+        What it does: Verifies web_search_tool_result.content as a string validates in a message.
+        Purpose: Edge case - error-style string result content.
+        """
+        print("Setup: Building assistant message with string result content...")
+        message = AnthropicMessage(
+            role="assistant",
+            content=[
+                {"id": "srvtoolu_1", "type": "server_tool_use", "name": "web_search", "input": {"query": "q"}},
+                {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": "too_many_requests"},
+            ],
+        )
+
+        print(f"Result: {message}")
+        assert message.content[1].content == "too_many_requests"
+
+    def test_multiple_web_search_blocks_in_one_message(self):
+        """
+        What it does: Verifies a message with multiple web_search block pairs validates.
+        Purpose: Edge case - more than one search in a single assistant turn.
+        """
+        print("Setup: Building assistant message with two web_search pairs...")
+        message = AnthropicMessage(
+            role="assistant",
+            content=[
+                {"id": "srvtoolu_1", "type": "server_tool_use", "name": "web_search", "input": {"query": "q1"}},
+                {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": []},
+                {"id": "srvtoolu_2", "type": "server_tool_use", "name": "web_search", "input": {"query": "q2"}},
+                {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_2", "content": []},
+                {"type": "text", "text": "Done."},
+            ],
+        )
+
+        print(f"Result content length: {len(message.content)}")
+        server_tool_uses = [b for b in message.content if b.type == "server_tool_use"]
+        assert len(server_tool_uses) == 2
+
+
+class TestAnthropicMessagesRequestWithWebSearch:
+    """Full-request validation tests reconstructing the failing production request."""
+
+    def test_request_with_web_search_message_validates(self):
+        """
+        What it does: Verifies a full AnthropicMessagesRequest with a web_search assistant
+                      message validates end-to-end.
+        Purpose: End-to-end validation for the 422 fix.
+        """
+        print("Setup: Building full request with web_search history...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role="user", content="What's the latest python release?"),
+                AnthropicMessage(role="assistant", content=_bug_log_web_search_content()),
+                AnthropicMessage(role="user", content="Thanks!"),
+            ],
+        )
+
+        print(f"Result messages count: {len(request.messages)}")
+        assert len(request.messages) == 3
+        assert request.messages[1].content[1].type == "server_tool_use"
+
+    def test_request_with_later_index_web_search_message_validates(self):
+        """
+        What it does: Reconstructs a ~30-message conversation where a message at a later
+                      index carries the text + server_tool_use + web_search_tool_result + text
+                      sequence, mirroring the production log (messages[29]).
+        Purpose: Regression test for the exact failing shape.
+        """
+        print("Setup: Building a 30-message conversation with web_search at index 29...")
+        messages = []
+        # 29 alternating simple messages (indices 0..28), starting with user
+        for i in range(29):
+            role = "user" if i % 2 == 0 else "assistant"
+            messages.append(AnthropicMessage(role=role, content=f"turn {i}"))
+        # Index 29: the assistant web_search message (must be assistant since 28 was user->29 assistant)
+        messages.append(AnthropicMessage(role="assistant", content=_bug_log_web_search_content()))
+
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=2048,
+            messages=messages,
+        )
+
+        print(f"Result messages count: {len(request.messages)}")
+        assert len(request.messages) == 30
+        assert request.messages[29].content[1].type == "server_tool_use"
+        assert request.messages[29].content[2].type == "web_search_tool_result"

@@ -162,7 +162,94 @@ class ImageContentBlock(BaseModel):
     source: Union[Base64ImageSource, URLImageSource]
 
 
-# Union type for all content blocks (including images and thinking)
+# ==================================================================================================
+# Server-Side Tool Content Blocks (web_search)
+# ==================================================================================================
+#
+# The gateway's own web_search feature (see kiro/mcp_tools.py) emits assistant
+# content that contains ``server_tool_use`` and ``web_search_tool_result`` blocks
+# (with nested ``web_search_result`` items). When a client sends the conversation
+# history back on a follow-up request, those blocks arrive on POST /v1/messages and
+# MUST validate — otherwise AnthropicMessage.content rejects the whole message with
+# an HTTP 422 before any conversion runs. These models exist so the gateway accepts
+# back the exact content it emits (round-trip integrity). They are intentionally
+# permissive (``extra="allow"``, optional fields) for forward compatibility with the
+# evolving Anthropic web_search schema.
+
+
+class WebSearchResultBlock(BaseModel):
+    """
+    Single web_search result item in Anthropic format.
+
+    Nested inside ``web_search_tool_result.content``. Produced by the gateway's
+    web_search feature from Kiro MCP results (see kiro/mcp_tools.py). All fields
+    are optional so empty or partial results (and future schema additions) never
+    trigger a validation error on round-trip.
+
+    Attributes:
+        type: Always "web_search_result"
+        title: Result title
+        url: Result URL
+        encrypted_content: Opaque/encrypted result content (snippet in our case)
+        page_age: Age of the page (may be null)
+    """
+
+    type: Literal["web_search_result"] = "web_search_result"
+    title: Optional[str] = None
+    url: Optional[str] = None
+    encrypted_content: Optional[str] = None
+    page_age: Optional[str] = None
+
+    model_config = {"extra": "allow"}
+
+
+class ServerToolUseContentBlock(BaseModel):
+    """
+    Server-side tool use content block in Anthropic format.
+
+    Represents a server-executed tool invocation (e.g. web_search) emitted by the
+    gateway. Unlike ``tool_use`` (client-side tools), this is executed on the
+    server and its result is delivered inline via ``web_search_tool_result``.
+
+    Attributes:
+        type: Always "server_tool_use"
+        id: Server tool use ID (e.g. "srvtoolu_...")
+        name: Tool name (e.g. "web_search")
+        input: Tool input arguments (e.g. {"query": "..."})
+    """
+
+    type: Literal["server_tool_use"] = "server_tool_use"
+    id: str
+    name: str
+    input: Dict[str, Any]
+
+    model_config = {"extra": "allow"}
+
+
+class WebSearchToolResultContentBlock(BaseModel):
+    """
+    Web search tool result content block in Anthropic format.
+
+    Carries the results of a ``server_tool_use`` web_search invocation. The
+    ``content`` field is normally a list of ``web_search_result`` items but may
+    also be a plain string (e.g. an error message). Raw dicts are accepted inside
+    the list for forward compatibility with schema changes.
+
+    Attributes:
+        type: Always "web_search_tool_result"
+        tool_use_id: ID of the server_tool_use block this result belongs to
+        content: Either a string or a list of web_search_result items (or dicts)
+    """
+
+    type: Literal["web_search_tool_result"] = "web_search_tool_result"
+    tool_use_id: str
+    content: Union[str, List[Union[WebSearchResultBlock, Dict[str, Any]]]]
+
+    model_config = {"extra": "allow"}
+
+
+# Union type for all content blocks (including images, thinking, and the
+# gateway-emitted server-side web_search blocks).
 ContentBlock = Union[
     TextContentBlock,
     ThinkingContentBlock,
@@ -170,6 +257,8 @@ ContentBlock = Union[
     ToolUseContentBlock,
     ToolResultContentBlock,
     ToolReferenceContentBlock,
+    ServerToolUseContentBlock,
+    WebSearchToolResultContentBlock,
 ]
 
 

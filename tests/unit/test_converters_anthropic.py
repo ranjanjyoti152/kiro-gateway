@@ -26,6 +26,7 @@ from kiro.converters_anthropic import (
     anthropic_to_kiro,
     extract_thinking_config_from_anthropic,
     extract_inline_system_messages,
+    build_web_search_fallback_text,
 )
 from kiro.converters_core import UnifiedMessage, UnifiedTool
 from kiro.models_anthropic import (
@@ -2154,3 +2155,358 @@ class TestAnthropicToKiroInlineSystem:
         assert "FIRST_SYS" in combined
         assert "SECOND_SYS" in combined
         assert combined.index("FIRST_SYS") < combined.index("SECOND_SYS")
+
+
+# ==================================================================================================
+# Tests for gateway-emitted web_search block handling (round-trip 422 fix)
+# ==================================================================================================
+#
+# The gateway's own web_search feature emits assistant content containing
+# server_tool_use and web_search_tool_result blocks alongside a <web_search> text
+# summary. When that history is sent back on POST /v1/messages, the converter must:
+#   - keep the surviving text (including the summary),
+#   - NOT treat server_tool_use as a tool_use (tool_call),
+#   - NOT treat web_search_tool_result as a tool_result,
+#   - never forward these unsupported block types to Kiro.
+
+import json
+
+
+def _web_search_assistant_content(query="latest python release"):
+    """
+    Build the exact assistant content structure from the production 422 bug log.
+
+    Args:
+        query: The web_search query to embed in the server_tool_use block.
+
+    Returns:
+        List of raw dict content blocks matching the gateway's emitted format.
+    """
+    return [
+        {"type": "text", "text": "Let me search for that."},
+        {
+            "id": "srvtoolu_fa2b1c3d4e5f6a7b8c9d0e1f",
+            "type": "server_tool_use",
+            "name": "web_search",
+            "input": {"query": query},
+        },
+        {
+            "type": "web_search_tool_result",
+            "tool_use_id": "srvtoolu_fa2b1c3d4e5f6a7b8c9d0e1f",
+            "content": [
+                {
+                    "type": "web_search_result",
+                    "title": "Python 3.13 released",
+                    "url": "https://python.org/downloads",
+                    "encrypted_content": "Python 3.13 is now available...",
+                    "page_age": None,
+                }
+            ],
+        },
+        {
+            "type": "text",
+            "text": f'\n<web_search>\nSearch results for "{query}":\n\n1. Title: **Python 3.13 released**\n</web_search>\n',
+            "cache_control": {"type": "ephemeral"},
+        },
+    ]
+
+
+class TestBuildWebSearchFallbackText:
+    """Tests for build_web_search_fallback_text helper."""
+
+    def test_returns_empty_for_non_list(self):
+        """
+        What it does: Verifies non-list input yields empty string.
+        Purpose: Ensure string content produces no fallback.
+        """
+        print("Setup: String content...")
+        result = build_web_search_fallback_text("just a string")
+
+        print(f"Comparing result: Expected '', Got '{result}'")
+        assert result == ""
+
+    def test_returns_empty_without_web_search_blocks(self):
+        """
+        What it does: Verifies plain text blocks produce no fallback.
+        Purpose: Ensure the helper only triggers for web_search blocks.
+        """
+        print("Setup: List with only text blocks...")
+        result = build_web_search_fallback_text([{"type": "text", "text": "hi"}])
+
+        print(f"Comparing result: Expected '', Got '{result}'")
+        assert result == ""
+
+    def test_folds_query_and_result_count(self):
+        """
+        What it does: Verifies fallback text includes the query and result count.
+        Purpose: Ensure search information is preserved when summary is absent.
+        """
+        print("Setup: server_tool_use + web_search_tool_result (no text summary)...")
+        content = [
+            {"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {"query": "python"}},
+            {"type": "web_search_tool_result", "tool_use_id": "s1", "content": [{"type": "web_search_result"}, {"type": "web_search_result"}]},
+        ]
+
+        result = build_web_search_fallback_text(content)
+
+        print(f"Result: {result}")
+        assert "<web_search>" in result
+        assert "python" in result
+        assert "2 result(s)" in result
+
+    def test_folds_multiple_queries(self):
+        """
+        What it does: Verifies multiple server_tool_use queries are folded.
+        Purpose: Edge case - more than one search in a message.
+        """
+        print("Setup: Two server_tool_use blocks...")
+        content = [
+            {"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {"query": "q1"}},
+            {"type": "server_tool_use", "id": "s2", "name": "web_search", "input": {"query": "q2"}},
+        ]
+
+        result = build_web_search_fallback_text(content)
+
+        print(f"Result: {result}")
+        assert "q1" in result
+        assert "q2" in result
+
+    def test_handles_result_block_without_query(self):
+        """
+        What it does: Verifies a lone web_search_tool_result still yields a fallback.
+        Purpose: Ensure a generic note is produced even without a query.
+        """
+        print("Setup: Only a web_search_tool_result block...")
+        content = [{"type": "web_search_tool_result", "tool_use_id": "s1", "content": []}]
+
+        result = build_web_search_fallback_text(content)
+
+        print(f"Result: {result}")
+        assert "<web_search>" in result
+        assert "Web search performed" in result
+
+
+class TestConvertAnthropicMessagesWebSearch:
+    """Tests for convert_anthropic_messages handling of web_search blocks."""
+
+    def test_keeps_text_summary_and_drops_structured_blocks(self):
+        """
+        What it does: Verifies the text summary is preserved and structured blocks
+                      do not become tool_calls/tool_results.
+        Purpose: Ensure graceful, transparent handling of gateway web_search content.
+        """
+        print("Setup: Assistant message with web_search content...")
+        messages = [AnthropicMessage(role="assistant", content=_web_search_assistant_content())]
+
+        result = convert_anthropic_messages(messages)
+
+        print(f"Result: {result}")
+        assert len(result) == 1
+        unified = result[0]
+        # Text summary and leading text are preserved
+        assert "Let me search for that." in unified.content
+        assert "<web_search>" in unified.content
+        # server_tool_use is NOT treated as a tool_use/tool_call
+        assert not unified.tool_calls
+        # web_search_tool_result is NOT treated as a tool_result
+        assert not unified.tool_results
+
+    def test_folds_fallback_when_summary_absent(self):
+        """
+        What it does: Verifies fallback text is folded when no <web_search> summary exists.
+        Purpose: Ensure search info is never silently lost.
+        """
+        print("Setup: Assistant message with web_search blocks but NO text summary...")
+        content = [
+            {"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {"query": "quantum computing"}},
+            {"type": "web_search_tool_result", "tool_use_id": "s1", "content": [{"type": "web_search_result", "title": "t"}]},
+        ]
+        messages = [AnthropicMessage(role="assistant", content=content)]
+
+        result = convert_anthropic_messages(messages)
+
+        print(f"Result: {result}")
+        assert len(result) == 1
+        assert "quantum computing" in result[0].content
+        assert "<web_search>" in result[0].content
+
+    def test_does_not_fold_when_summary_present(self):
+        """
+        What it does: Verifies fallback is NOT appended when a summary already exists.
+        Purpose: Avoid duplicating information.
+        """
+        print("Setup: Assistant message WITH text summary...")
+        messages = [AnthropicMessage(role="assistant", content=_web_search_assistant_content())]
+
+        result = convert_anthropic_messages(messages)
+
+        print(f"Result content: {result[0].content}")
+        # Only one <web_search> section (from the original summary), not a folded duplicate
+        assert result[0].content.count("<web_search>") == 1
+
+
+class TestAnthropicToKiroWebSearch:
+    """Full Anthropic -> Kiro payload conversion tests for web_search round-trip."""
+
+    def _convert(self, request):
+        """Convert a request with model resolution and fake reasoning mocked off."""
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-sonnet-4.5",
+        ):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+                return anthropic_to_kiro(request, "conv-123", "arn:aws:test")
+
+    def test_payload_valid_and_excludes_unsupported_blocks(self):
+        """
+        What it does: Verifies a conversation with web_search blocks produces a valid
+                      Kiro payload that does NOT contain the unsupported block types.
+        Purpose: Core assertion for the fix - no server_tool_use / web_search_tool_result
+                 leaks to Kiro.
+        """
+        print("Setup: Multi-turn request with a web_search assistant message...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role="user", content="What's the latest python release?"),
+                AnthropicMessage(role="assistant", content=_web_search_assistant_content()),
+                AnthropicMessage(role="user", content="Thanks, summarize it."),
+            ],
+        )
+
+        result = self._convert(request)
+
+        print(f"Result keys: {list(result.keys())}")
+        assert "conversationState" in result
+        assert result["conversationState"]["conversationId"] == "conv-123"
+
+        payload_json = json.dumps(result)
+        # The unsupported block *types* must never appear in the Kiro payload
+        assert "server_tool_use" not in payload_json
+        assert "web_search_tool_result" not in payload_json
+        assert "web_search_result" not in payload_json
+
+    def test_payload_preserves_text_summary_and_ordering(self):
+        """
+        What it does: Verifies the assistant web_search text summary is preserved in
+                      history and message ordering is maintained.
+        Purpose: Ensure transparent round-trip - the search summary survives.
+        """
+        print("Setup: Multi-turn request with a web_search assistant message...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role="user", content="What's the latest python release?"),
+                AnthropicMessage(role="assistant", content=_web_search_assistant_content()),
+                AnthropicMessage(role="user", content="Thanks, summarize it."),
+            ],
+        )
+
+        result = self._convert(request)
+
+        history = result["conversationState"].get("history", [])
+        print(f"History entries: {len(history)}")
+        history_json = json.dumps(history)
+        # The assistant summary text is preserved in history
+        assert "<web_search>" in history_json
+        assert "Let me search for that." in history_json
+
+        # Ordering preserved: first history entry is the user question,
+        # and it is followed by the assistant web_search turn.
+        assert "userInputMessage" in history[0]
+        assert "latest python release" in json.dumps(history[0])
+        assert "assistantResponseMessage" in history[1]
+
+        # Current message is the final user follow-up
+        current = result["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+        assert "summarize it" in current
+
+    def test_regression_30_message_request(self):
+        """
+        What it does: Reconstructs a 30-message conversation with the web_search
+                      sequence at a later index and verifies it converts successfully.
+        Purpose: Regression test for the exact failing production request shape.
+        """
+        print("Setup: Building 30-message conversation with web_search at index 29...")
+        messages = []
+        for i in range(29):
+            role = "user" if i % 2 == 0 else "assistant"
+            messages.append(AnthropicMessage(role=role, content=f"turn {i}"))
+        messages.append(AnthropicMessage(role="assistant", content=_web_search_assistant_content()))
+        # Final user message so the web_search turn lands in history
+        messages.append(AnthropicMessage(role="user", content="Final question"))
+
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=2048,
+            messages=messages,
+        )
+
+        result = self._convert(request)
+
+        print(f"Result keys: {list(result.keys())}")
+        assert "conversationState" in result
+        payload_json = json.dumps(result)
+        assert "server_tool_use" not in payload_json
+        assert "web_search_tool_result" not in payload_json
+        # The summary text still survives somewhere in the payload
+        assert "<web_search>" in payload_json
+
+    def test_string_result_content_converts(self):
+        """
+        What it does: Verifies web_search_tool_result.content as a string converts cleanly.
+        Purpose: Edge case - error-style string result content.
+        """
+        print("Setup: web_search message with string result content...")
+        content = [
+            {"id": "s1", "type": "server_tool_use", "name": "web_search", "input": {"query": "q"}},
+            {"type": "web_search_tool_result", "tool_use_id": "s1", "content": "rate_limited"},
+            {"type": "text", "text": "\n<web_search>\nRate limited.\n</web_search>\n"},
+        ]
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role="user", content="Search please"),
+                AnthropicMessage(role="assistant", content=content),
+                AnthropicMessage(role="user", content="ok"),
+            ],
+        )
+
+        result = self._convert(request)
+
+        payload_json = json.dumps(result)
+        assert "server_tool_use" not in payload_json
+        assert "web_search_tool_result" not in payload_json
+
+    def test_empty_results_and_multiple_blocks_convert(self):
+        """
+        What it does: Verifies empty result lists and multiple web_search blocks convert.
+        Purpose: Edge cases - zero results and multiple searches in one turn.
+        """
+        print("Setup: web_search message with empty results and two search pairs...")
+        content = [
+            {"id": "s1", "type": "server_tool_use", "name": "web_search", "input": {"query": "q1"}},
+            {"type": "web_search_tool_result", "tool_use_id": "s1", "content": []},
+            {"id": "s2", "type": "server_tool_use", "name": "web_search", "input": {"query": "q2"}},
+            {"type": "web_search_tool_result", "tool_use_id": "s2", "content": []},
+            {"type": "text", "text": "\n<web_search>\nNo results found.\n</web_search>\n"},
+        ]
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role="user", content="Search please"),
+                AnthropicMessage(role="assistant", content=content),
+                AnthropicMessage(role="user", content="ok"),
+            ],
+        )
+
+        result = self._convert(request)
+
+        payload_json = json.dumps(result)
+        assert "server_tool_use" not in payload_json
+        assert "web_search_tool_result" not in payload_json
+        assert "<web_search>" in payload_json

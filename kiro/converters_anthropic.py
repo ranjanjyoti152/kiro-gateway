@@ -255,6 +255,84 @@ def extract_tool_uses_from_anthropic_content(content: Any) -> List[Dict[str, Any
     return tool_calls
 
 
+def build_web_search_fallback_text(content: Any) -> str:
+    """
+    Builds concise fallback text for gateway-emitted web_search blocks.
+
+    The gateway's own web_search feature (see kiro/mcp_tools.py) emits assistant
+    content that mixes a human-readable ``<web_search>`` text summary with
+    structured ``server_tool_use`` and ``web_search_tool_result`` blocks. The
+    structured blocks are dropped before the payload reaches Kiro (which has no
+    schema for them), and the text summary normally preserves the information a
+    downstream model needs.
+
+    This function is a safety net for the rare case where that text summary is
+    absent: it folds the ``server_tool_use`` query (and the number of results
+    when available) into a short text string wrapped in ``<web_search>`` tags,
+    matching the style of the primary summary, so the fact that a search happened
+    is never silently lost.
+
+    Args:
+        content: Anthropic message content (list of content blocks or otherwise)
+
+    Returns:
+        A concise ``<web_search>``-wrapped text representation of the search, or
+        an empty string if the content has no server_tool_use /
+        web_search_tool_result blocks to summarize.
+
+    Example:
+        >>> build_web_search_fallback_text([
+        ...     {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search",
+        ...      "input": {"query": "python 3.13"}},
+        ...     {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1",
+        ...      "content": [{"type": "web_search_result", "title": "t", "url": "u"}]},
+        ... ])
+        '\\n<web_search>\\nWeb search performed for: python 3.13 (1 result(s))\\n</web_search>\\n'
+    """
+    if not isinstance(content, list):
+        return ""
+
+    queries: List[str] = []
+    total_results = 0
+    has_web_search = False
+
+    for block in content:
+        if isinstance(block, dict):
+            block_type = block.get("type")
+            block_input = block.get("input", {})
+            block_content = block.get("content")
+        elif hasattr(block, "type"):
+            block_type = block.type
+            block_input = getattr(block, "input", {})
+            block_content = getattr(block, "content", None)
+        else:
+            continue
+
+        if block_type == "server_tool_use":
+            has_web_search = True
+            if isinstance(block_input, dict):
+                query = str(block_input.get("query", "")).strip()
+                if query:
+                    queries.append(query)
+        elif block_type == "web_search_tool_result":
+            has_web_search = True
+            if isinstance(block_content, list):
+                total_results += len(block_content)
+
+    if not has_web_search:
+        return ""
+
+    if queries:
+        summary = f"Web search performed for: {'; '.join(queries)}"
+    else:
+        summary = "Web search performed"
+
+    if total_results:
+        summary += f" ({total_results} result(s))"
+
+    return f"\n<web_search>\n{summary}\n</web_search>\n"
+
+
 def extract_inline_system_messages(
     messages: List[AnthropicMessage],
 ) -> Tuple[List[str], List[AnthropicMessage]]:
@@ -329,6 +407,22 @@ def convert_anthropic_messages(
 
         # Extract text content
         text_content = convert_anthropic_content_to_text(content)
+
+        # Gateway round-trip integrity for web_search:
+        # Assistant messages emitted by the gateway's web_search feature contain
+        # server_tool_use / web_search_tool_result blocks. These are unsupported by
+        # Kiro and are dropped here (convert_anthropic_content_to_text keeps only
+        # text blocks). The accompanying <web_search> text summary normally carries
+        # the information, but if that summary is absent we fold a concise text
+        # representation of the query/results so nothing is silently lost.
+        if not text_content.strip():
+            fallback_text = build_web_search_fallback_text(content)
+            if fallback_text:
+                text_content = fallback_text
+                logger.debug(
+                    "Folded gateway web_search blocks into text "
+                    "(no <web_search> summary present in message)"
+                )
 
         # Extract tool-related data and images based on role
         tool_calls = None
