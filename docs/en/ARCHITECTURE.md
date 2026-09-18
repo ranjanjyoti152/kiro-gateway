@@ -10,7 +10,8 @@ The main goal of the system is to provide transparent compatibility between mult
 
 | API | Endpoints | Status |
 |-----|-----------|--------|
-| **OpenAI** | `/v1/models`, `/v1/chat/completions` | ✅ Supported |
+| **OpenAI Chat Completions** | `/v1/models`, `/v1/chat/completions` | ✅ Supported |
+| **OpenAI Responses** | `/v1/responses` | ✅ Supported |
 | **Anthropic** | `/v1/messages` | ✅ Supported |
 
 ### Architectural Model
@@ -18,21 +19,23 @@ The main goal of the system is to provide transparent compatibility between mult
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                          Clients                                │
-│  ┌─────────────────────┐       ┌─────────────────────┐         │
-│  │  OpenAI SDK/Tools   │       │ Anthropic SDK/Tools │         │
-│  │  (Cursor, Cline,    │       │ (Claude Code,       │         │
-│  │   Continue, etc.)   │       │  Anthropic SDK)     │         │
-│  └──────────┬──────────┘       └──────────┬──────────┘         │
-└─────────────┼──────────────────────────────┼───────────────────┘
-              │                              │
-              ▼                              ▼
+│  ┌──────────────────┐  ┌──────────────────┐  ┌───────────────┐ │
+│  │ OpenAI SDK/Tools │  │  OpenAI Codex    │  │ Anthropic SDK │ │
+│  │ (Cursor, Cline,  │  │  CLI             │  │ (Claude Code) │ │
+│  │  Continue, ...)  │  │  wire_api =      │  │               │ │
+│  │                  │  │  "responses"     │  │               │ │
+│  └────────┬─────────┘  └────────┬─────────┘  └───────┬───────┘ │
+└───────────┼─────────────────────┼────────────────────┼─────────┘
+            │                     │                    │
+            ▼                     ▼                    ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                      Kiro Gateway                               │
-│  ┌─────────────────────┐       ┌─────────────────────┐         │
-│  │  OpenAI Adapter     │       │  Anthropic Adapter  │         │
-│  │  /v1/chat/...       │       │  /v1/messages       │         │
-│  └──────────┬──────────┘       └──────────┬──────────┘         │
-│             └──────────────┬───────────────┘                    │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌───────────────┐ │
+│  │ Chat Completions │  │ Responses        │  │ Anthropic     │ │
+│  │ Adapter          │  │ Adapter          │  │ Adapter       │ │
+│  │ /v1/chat/...     │  │ /v1/responses    │  │ /v1/messages  │ │
+│  └────────┬─────────┘  └────────┬─────────┘  └───────┬───────┘ │
+│           └───────────────┬─────┴────────────────────┘          │
 │                            ▼                                    │
 │             ┌─────────────────────────────┐                     │
 │             │      Core Layer             │                     │
@@ -88,10 +91,18 @@ kiro-gateway/
 │   │   # ═══════════════════════════════════════════════════════
 │   │   # OPENAI API LAYER
 │   │   # ═══════════════════════════════════════════════════════
-│   ├── models_openai.py       # Pydantic models for OpenAI API
-│   ├── converters_openai.py   # OpenAI → Kiro adapter
-│   ├── routes_openai.py       # FastAPI routes for OpenAI
-│   ├── streaming_openai.py    # Kiro → OpenAI SSE formatter
+│   ├── models_openai.py       # Pydantic models for OpenAI Chat Completions
+│   ├── converters_openai.py   # OpenAI Chat Completions → Kiro adapter
+│   ├── routes_openai.py       # FastAPI routes for OpenAI Chat Completions
+│   ├── streaming_openai.py    # Kiro → OpenAI Chat Completions SSE formatter
+│   │
+│   │   # ═══════════════════════════════════════════════════════
+│   │   # OPENAI RESPONSES API LAYER (OpenAI Codex CLI)
+│   │   # ═══════════════════════════════════════════════════════
+│   ├── models_openai_responses.py     # Pydantic models for Responses API
+│   ├── converters_openai_responses.py # Responses → Kiro adapter
+│   ├── routes_openai_responses.py     # FastAPI route POST /v1/responses
+│   ├── streaming_openai_responses.py  # Kiro → Responses named SSE events
 │   │
 │   │   # ═══════════════════════════════════════════════════════
 │   │   # ANTHROPIC API LAYER
@@ -388,8 +399,96 @@ Supports async context manager (`async with`).
 | `/health` | GET | Detailed health check (status, timestamp, version) |
 | `/v1/models` | GET | List of available models (requires API key) |
 | `/v1/chat/completions` | POST | Chat completions (requires API key) |
+| `/v1/responses` | POST | Responses API — see 3.10.1 (requires API key) |
 
 **Authentication:** Bearer token in `Authorization` header
+
+### 3.10.1. Responses API (`kiro/routes_openai_responses.py`)
+
+`POST /v1/responses` implements the OpenAI **Responses API**, the wire protocol
+used by **OpenAI Codex CLI** when it is configured with `wire_api = "responses"`.
+It is a separate surface from Chat Completions, not a variation of it:
+
+| Aspect | Chat Completions | Responses |
+|--------|------------------|-----------|
+| Prompt | `messages: [...]` | `input: string \| [items]` |
+| System prompt | `role: "system"` message | `instructions` field + `developer` items |
+| Tool spec | `{type:"function", function:{...}}` | `{type:"function", name, parameters}` (flat) |
+| Tool grouping | — | `{type:"namespace", name, tools:[...]}` |
+| Tool call in history | `assistant.tool_calls[]` | `function_call` item (`call_id`) |
+| Tool result in history | `role: "tool"` message | `function_call_output` item (`call_id`) |
+| Reply | `choices[].message` | `output: [items]` |
+| Streaming | `data: {chunk}` + `[DONE]` | named events + `response.completed` |
+| Usage | `prompt_tokens` / `completion_tokens` | `input_tokens` / `output_tokens` |
+
+**Module responsibilities**
+
+| Module | Responsibility |
+|--------|----------------|
+| `models_openai_responses.py` | Pydantic models (`extra="allow"` throughout) |
+| `converters_openai_responses.py` | Responses → `UnifiedMessage`/`UnifiedTool` → `build_kiro_payload` |
+| `streaming_openai_responses.py` | Kiro stream → named Responses SSE events; non-streaming assembly |
+| `routes_openai_responses.py` | Endpoint, auth, profileArn resolution, account failover, debug logging |
+
+**Namespace flattening.** Kiro API accepts only a flat list of uniquely named
+tools. A `namespace` container is flattened to `namespace__toolname`, and a
+`ToolRegistry` maps the flat name back to the client's `name` + `namespace` when
+the tool call is reported. If `namespace__toolname` would exceed the Kiro
+64-character tool-name limit, the bare name is used and a WARNING is logged; the
+registry still carries the namespace, so routing stays correct.
+
+**Built-in tools.** `{"type": "web_search"}` is exposed to the model as a regular
+function tool and serviced by the gateway through the Kiro MCP endpoint (the same
+Path B emulation the Chat Completions surface uses), when `WEB_SEARCH_ENABLED`.
+Any other server-side tool type (`code_interpreter`, `file_search`, ...) is named
+in a WARNING and not offered to the model.
+
+**Streaming event order.** Item envelopes are always opened before their deltas,
+because Codex CLI reports `OutputTextDelta without active item` otherwise:
+
+```
+response.created
+response.in_progress
+response.output_item.added             (reasoning,     output_index 0)
+response.reasoning_summary_part.added  (summary_index 0)
+response.reasoning_summary_text.delta  ...
+response.reasoning_summary_text.done
+response.reasoning_summary_part.done
+response.output_item.done              (reasoning)
+response.output_item.added             (message,       output_index 1)
+response.content_part.added            (content_index 0)
+response.output_text.delta             ...
+response.output_text.done
+response.content_part.done
+response.output_item.done              (message)
+response.output_item.added             (function_call, output_index 2)
+response.function_call_arguments.delta
+response.function_call_arguments.done
+response.output_item.done              (function_call)
+response.completed
+```
+
+`sequence_number` increases strictly over the whole stream, including the
+terminal `response.failed` emitted when the upstream stream breaks mid-response.
+Reasoning events are produced only when `FAKE_REASONING_HANDLING ==
+"as_reasoning_content"`; in every other mode thinking is streamed as ordinary
+`output_text`, matching the Chat Completions surface.
+
+**Unsupported fields.** The gateway is stateless, so:
+
+| Field | Behaviour |
+|-------|-----------|
+| `previous_response_id` | **HTTP 400** with an actionable message. The referenced conversation was never stored, so answering would silently drop history. |
+| `store: true` | Accepted. The client still sends the full `input`, so the answer is correct; the response reports `store: false` and a WARNING names the field. |
+| `include: ["reasoning.encrypted_content"]` | Accepted, WARNING. Reasoning is reconstructed from plain text, so no encrypted payload exists. |
+| `tool_choice` (≠ `auto`), `parallel_tool_calls: false`, `text.format`, `temperature`, `top_p`, `truncation`, `service_tier`, `max_output_tokens` | Accepted, named in a single WARNING. Kiro API exposes no equivalent. `max_output_tokens` is still used to size the thinking budget. |
+| `reasoning` items in `input` | Dropped (DEBUG). Kiro API has no slot for replayed reasoning. |
+
+Truncated output is reported as `status: "incomplete"` with
+`incomplete_details.reason` inside a normal `response.completed` event rather
+than a `response.incomplete` event, because clients treat the latter as a hard
+failure while the gateway's truncation-recovery system already notifies the model
+on the next request.
 
 ### 3.11. Exception Handling (`kiro/exceptions.py`)
 
@@ -671,6 +770,7 @@ TOOL_DESCRIPTION_MAX_LENGTH="10000"
 |----------|--------|-------------|
 | `/v1/models` | GET | List of available models |
 | `/v1/chat/completions` | POST | Chat completions (streaming/non-streaming) |
+| `/v1/responses` | POST | Responses API — OpenAI Codex CLI (streaming/non-streaming) |
 
 **Authentication:** `Authorization: Bearer {PROXY_API_KEY}`
 
@@ -684,14 +784,14 @@ TOOL_DESCRIPTION_MAX_LENGTH="10000"
 
 ### 7.4 Format Comparison
 
-| Aspect | OpenAI | Anthropic |
-|--------|--------|-----------|
-| System prompt | In `messages` with `role: "system"` | Separate `system` field |
-| Content | String or array | Always array of content blocks |
-| Stop reason | `finish_reason: "stop"` | `stop_reason: "end_turn"` |
-| Usage | `prompt_tokens`, `completion_tokens` | `input_tokens`, `output_tokens` |
-| Streaming | `data: {...}\n\n` + `data: [DONE]` | `event: type\ndata: {...}\n\n` |
-| Tool format | `{type: "function", function: {...}}` | `{name: "...", input_schema: {...}}` |
+| Aspect | OpenAI Chat Completions | OpenAI Responses | Anthropic |
+|--------|-------------------------|------------------|-----------|
+| System prompt | In `messages` with `role: "system"` | `instructions` + `developer` items | Separate `system` field |
+| Content | String or array | `input` string or item array | Always array of content blocks |
+| Stop reason | `finish_reason: "stop"` | `status: "completed"` | `stop_reason: "end_turn"` |
+| Usage | `prompt_tokens`, `completion_tokens` | `input_tokens`, `output_tokens` | `input_tokens`, `output_tokens` |
+| Streaming | `data: {...}\n\n` + `data: [DONE]` | `event: response.*\ndata: {...}\n\n` + `response.completed` | `event: type\ndata: {...}\n\n` |
+| Tool format | `{type: "function", function: {...}}` | `{type: "function", name, parameters}` | `{name: "...", input_schema: {...}}` |
 
 ## 8. Implementation Features
 

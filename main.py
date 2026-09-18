@@ -85,6 +85,7 @@ from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
 from kiro.account_manager import AccountManager
 from kiro.routes_openai import router as openai_router
+from kiro.routes_openai_responses import router as openai_responses_router
 from kiro.routes_anthropic import router as anthropic_router
 from kiro.exceptions import validation_exception_handler
 from kiro.debug_middleware import DebugLoggerMiddleware
@@ -567,6 +568,9 @@ app.add_exception_handler(RequestValidationError, validation_exception_handler)
 # --- Route Registration ---
 # OpenAI-compatible API: /v1/models, /v1/chat/completions
 app.include_router(openai_router)
+
+# OpenAI Responses API: /v1/responses (used by OpenAI Codex CLI)
+app.include_router(openai_responses_router)
 
 # Anthropic-compatible API: /v1/messages
 app.include_router(anthropic_router)

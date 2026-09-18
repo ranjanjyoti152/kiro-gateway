@@ -516,6 +516,7 @@ Leave `VPN_PROXY_URL` empty (default) if you don't need proxy support.
 | `/health` | GET | Detailed health check |
 | `/v1/models` | GET | List available models |
 | `/v1/chat/completions` | POST | OpenAI Chat Completions API |
+| `/v1/responses` | POST | OpenAI Responses API (OpenAI Codex CLI) |
 | `/v1/messages` | POST | Anthropic Messages API |
 
 ---
@@ -632,6 +633,108 @@ llm = ChatOpenAI(
 response = llm.invoke("Hello, how are you?")
 print(response.content)
 ```
+
+</details>
+
+### OpenAI Responses API (Codex CLI)
+
+`POST /v1/responses` implements the OpenAI Responses API, so **OpenAI Codex CLI**
+can use the gateway as its backend.
+
+<details>
+<summary>🤖 OpenAI Codex CLI</summary>
+
+Add a provider block to `~/.codex/config.toml`. The important part is
+`wire_api = "responses"`, which is what makes Codex talk to `/v1/responses`:
+
+```toml
+model = "claude-sonnet-4.5"
+model_provider = "kiro"
+
+[model_providers.kiro]
+name = "Kiro Gateway"
+base_url = "http://localhost:8000/v1"
+env_key = "KIRO_API_KEY"
+wire_api = "responses"
+```
+
+Then export your gateway key and run Codex:
+
+```bash
+export KIRO_API_KEY="my-super-secret-password-123"  # Your PROXY_API_KEY from .env
+codex "Count the lines in data.txt with a shell command and report the number."
+```
+
+Codex prints a `Model metadata for 'claude-sonnet-4.5' not found` warning because
+it has no built-in card for Claude models; it is harmless.
+
+</details>
+
+<details>
+<summary>🔹 Simple cURL Request</summary>
+
+```bash
+curl http://localhost:8000/v1/responses \
+  -H "Authorization: Bearer my-super-secret-password-123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "instructions": "You are a helpful assistant.",
+    "input": "What is 2+2?",
+    "stream": false
+  }'
+```
+
+</details>
+
+<details>
+<summary>🛠️ With Tool Calling</summary>
+
+Note that Responses tool specs are **flat** — `name` and `parameters` sit at the
+top level, not nested under `"function"`:
+
+```bash
+curl http://localhost:8000/v1/responses \
+  -H "Authorization: Bearer my-super-secret-password-123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "input": [
+      {"type": "message", "role": "user",
+       "content": [{"type": "input_text", "text": "What is the weather in London?"}]}
+    ],
+    "tools": [{
+      "type": "function",
+      "name": "get_weather",
+      "description": "Get weather for a location",
+      "parameters": {
+        "type": "object",
+        "properties": {"location": {"type": "string", "description": "City name"}},
+        "required": ["location"]
+      }
+    }],
+    "stream": true
+  }'
+```
+
+</details>
+
+<details>
+<summary>⚠️ Limitations</summary>
+
+The gateway is stateless, so it never stores a response:
+
+- **`previous_response_id`** returns HTTP 400 with an actionable message. Send the
+  full conversation in `input` instead (this is what Codex CLI already does).
+- **`store: true`** is accepted, but the response reports `store: false` and a
+  warning is logged. The answer is correct because the client still sends the
+  full `input`; only the server-side copy is missing.
+- **`include: ["reasoning.encrypted_content"]`**, `tool_choice`, `temperature`,
+  `top_p`, `truncation`, `service_tier`, `parallel_tool_calls: false` and
+  `text.format` are accepted and named in a single warning — Kiro API has no
+  equivalent. `max_output_tokens` is used only to size the thinking budget.
+- Built-in server-side tools other than `web_search` (`code_interpreter`,
+  `file_search`, ...) are not offered to the model; a warning names them.
 
 </details>
 

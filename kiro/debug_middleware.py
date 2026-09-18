@@ -45,7 +45,8 @@ from kiro.config import DEBUG_MODE
 # API endpoints that should have debug logging enabled
 # These are the main API endpoints that process user requests
 LOGGED_ENDPOINTS = frozenset({
-    "/v1/chat/completions",  # OpenAI-compatible endpoint
+    "/v1/chat/completions",  # OpenAI Chat Completions endpoint
+    "/v1/responses",         # OpenAI Responses endpoint (Codex CLI)
     "/v1/messages",          # Anthropic-compatible endpoint
 })
 

@@ -80,6 +80,7 @@ tests/
 │   ├── test_converters_anthropic.py # Anthropic Messages API → Kiro converter tests
 │   ├── test_converters_core.py     # Shared conversion logic tests (UnifiedMessage, merging, truncation recovery system prompt)
 │   ├── test_converters_openai.py   # OpenAI Chat API → Kiro converter tests
+│   ├── test_converters_openai_responses.py # OpenAI Responses API → Kiro converter tests (tool flattening, namespaces, additional_tools merging, freeform "custom" tools, tool round-trip, unsupported fields)
 │   ├── test_debug_logger.py        # DebugLogger tests (off/errors/all modes)
 │   ├── test_debug_middleware.py    # DebugLoggerMiddleware tests (endpoint filtering, mode handling)
 │   ├── test_exceptions.py          # Exception handlers tests (validation_exception_handler, sanitize_validation_errors)
@@ -92,19 +93,23 @@ tests/
 │   ├── test_model_resolver.py      # Dynamic Model Resolution System tests
 │   ├── test_models_anthropic.py    # Anthropic Pydantic models tests (all content blocks, tools, streaming, server-side tools)
 │   ├── test_models_openai.py       # OpenAI Pydantic models tests (messages, tools, responses, streaming)
+│   ├── test_models_openai_responses.py # OpenAI Responses API Pydantic models tests (input items, flat/namespace/built-in/custom tools, additional_tools and custom_tool_call items, output items, usage)
 │   ├── test_network_errors.py      # Network error handling tests
 │   ├── test_parsers.py             # AwsEventStreamParser tests (JSON truncation diagnostics, truncation recovery integration)
 │   ├── test_routes_anthropic.py    # Anthropic API endpoint tests (/v1/messages, truncation recovery, WebSearch, Account System failover)
 │   ├── test_routes_openai.py       # OpenAI API endpoint tests (/v1/chat/completions, truncation recovery, WebSearch, Account System failover)
+│   ├── test_routes_openai_responses.py # Responses API endpoint tests (/v1/responses, request echo, profileArn errors, client selection, upstream errors, Codex code-mode payloads)
 │   ├── test_streaming_anthropic.py # Anthropic streaming response tests (truncation detection, stop_reason priority, initial_response reuse)
 │   ├── test_streaming_core.py      # Shared streaming logic tests (first-token retry, initial_response parameter)
 │   ├── test_streaming_openai.py    # OpenAI streaming response tests (truncation detection, finish_reason priority, initial_response reuse)
+│   ├── test_streaming_openai_responses.py # Responses API streaming tests (event ordering, sequence_number, reasoning/tool events, custom_tool_call events, non-streaming collection, failure modes)
 │   ├── test_thinking_parser.py     # ThinkingParser tests (FSM for thinking blocks)
 │   ├── test_tokenizer.py           # Tokenizer tests (tiktoken)
 │   ├── test_tool_sanitizer.py      # Kiro tool spec sanitizer tests (name rules, schema rules, description/schema repairs, duplicates)
 │   ├── test_truncation_recovery.py # Truncation Recovery System tests (synthetic message generation)
 │   ├── test_truncation_state.py    # Truncation state cache tests (save/retrieve, one-time retrieval, thread safety)
 │   └── test_vpn_proxy.py           # VPN/Proxy configuration tests (environment variables, URL normalization, NO_PROXY)
+│   ├── codex_responses_payload.py  # Real request payloads captured from OpenAI Codex CLI 0.153.4 (shared fixture, not a test module)
 ├── integration/                     # Integration tests for full flow
 │   ├── test_account_system_flow.py # Account System integration tests (full failover, sticky behavior, Circuit Breaker, state persistence)
 │   └── test_full_flow.py           # End-to-end tests
@@ -133,6 +138,25 @@ Each test follows the pattern:
 - **Integration tests**: Verify component interactions
 - **Security tests**: Verify security system
 - **Edge case tests**: Paranoid edge case checks
+
+## Captured Client Payloads
+
+`tests/unit/codex_responses_payload.py` holds request bodies captured from a real
+**OpenAI Codex CLI 0.153.4** session against `POST /v1/responses`:
+
+- `CODEX_RESPONSES_REQUEST` — first turn of a session (plain prompt, 9 tool
+  entries including a `namespace` container and the built-in `web_search`).
+- `CODEX_RESPONSES_FOLLOW_UP_REQUEST` — the turn Codex sends after running a
+  tool, carrying the `function_call` / `function_call_output` round trip.
+
+Only long free-text values were truncated; every field name, item shape and tool
+shape is exactly what Codex sent. The models, converter and route test suites all
+assert against these payloads, so a change in the Codex contract shows up as a
+test failure rather than a broken client.
+
+It is a plain module, not a test file, and is imported as
+`from codex_responses_payload import ...` (pytest puts `tests/unit/` on
+`sys.path`).
 
 ## Adding New Tests
 

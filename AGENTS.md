@@ -268,17 +268,21 @@ kiro-gateway/
 │   ├── cache.py                     # Model metadata cache
 │   ├── model_resolver.py            # Dynamic model resolution
 │   ├── http_client.py               # HTTP client with retry logic
-│   ├── routes_openai.py             # OpenAI API endpoints
+│   ├── routes_openai.py             # OpenAI Chat Completions endpoints
+│   ├── routes_openai_responses.py   # OpenAI Responses API endpoint (Codex CLI)
 │   ├── routes_anthropic.py          # Anthropic API endpoints
 │   ├── converters_core.py           # Shared conversion logic
-│   ├── converters_openai.py         # OpenAI format converters
+│   ├── converters_openai.py         # OpenAI Chat Completions converters
+│   ├── converters_openai_responses.py # OpenAI Responses API converters
 │   ├── converters_anthropic.py      # Anthropic format converters
 │   ├── streaming_core.py            # Shared streaming logic
-│   ├── streaming_openai.py          # OpenAI streaming
+│   ├── streaming_openai.py          # OpenAI Chat Completions streaming
+│   ├── streaming_openai_responses.py # OpenAI Responses API streaming (named SSE events)
 │   ├── streaming_anthropic.py       # Anthropic streaming
 │   ├── parsers.py                   # AWS SSE stream parsers
 │   ├── thinking_parser.py           # Thinking block parser (FSM)
-│   ├── models_openai.py             # OpenAI Pydantic models
+│   ├── models_openai.py             # OpenAI Chat Completions Pydantic models
+│   ├── models_openai_responses.py   # OpenAI Responses API Pydantic models
 │   ├── models_anthropic.py          # Anthropic Pydantic models
 │   ├── network_errors.py            # Network error classification
 │   ├── kiro_errors.py               # Kiro API error enhancement
@@ -682,6 +686,7 @@ HIDDEN_MODELS = [
 - `GET /health`: Detailed health check
 - `GET /v1/models`: List available models
 - `POST /v1/chat/completions`: Chat completions (streaming and non-streaming)
+- `POST /v1/responses`: Responses API used by OpenAI Codex CLI (streaming and non-streaming)
 
 ### Anthropic-Compatible API
 
