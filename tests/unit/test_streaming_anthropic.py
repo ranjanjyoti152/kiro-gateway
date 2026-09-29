@@ -27,7 +27,7 @@ from kiro.streaming_anthropic import (
     collect_anthropic_response,
     stream_with_first_token_retry_anthropic,
 )
-from kiro.streaming_core import KiroEvent, StreamResult
+from kiro.streaming_core import FirstTokenTimeoutError, KiroEvent, StreamResult
 
 
 # ==================================================================================================
@@ -1740,3 +1740,153 @@ class TestCollectAnthropicResponseConnectionDrop:
                 await collect_anthropic_response(
                     mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
                 )
+
+
+# ==================================================================================================
+# Tests for deferred message_start (first-token retries never duplicate output)
+# ==================================================================================================
+
+def _sse_event_names(chunks):
+    """Extract the ``event:`` names from Anthropic SSE chunks."""
+    names = []
+    for chunk in chunks:
+        for line in chunk.splitlines():
+            if line.startswith("event: "):
+                names.append(line[len("event: "):])
+    return names
+
+
+class TestAnthropicMessageStartDeferral:
+    """
+    Tests that message_start is withheld until the upstream stream is usable.
+
+    Claude Code treats a second message_start as a corrupted stream, so a
+    first-token retry must never expose the opening of an abandoned attempt.
+    """
+
+    HEALTHY_CHUNKS = [
+        b'{"content":"Hello"}',
+        b'{"content":" there"}',
+        b'{"contextUsagePercentage":2.0}',
+    ]
+
+    @pytest.mark.asyncio
+    async def test_timed_out_attempt_emits_nothing_and_skips_estimation(
+        self, mock_model_cache, mock_auth_manager, kiro_stream_response_factory
+    ):
+        """
+        What it does: Emits no frames and runs no token estimation when the first chunk never arrives.
+        Purpose: A timed-out attempt must be invisible and cheap so it can be retried.
+        """
+        stalled = kiro_stream_response_factory(stall=True)
+        chunks = []
+
+        with patch("kiro.streaming_anthropic.estimate_request_tokens") as mock_estimate:
+            with pytest.raises(FirstTokenTimeoutError):
+                async for chunk in stream_kiro_to_anthropic(
+                    stalled, "claude-sonnet-4.5", mock_model_cache, mock_auth_manager,
+                    first_token_timeout=0.02,
+                    request_messages=[{"role": "user", "content": "hi"}],
+                ):
+                    chunks.append(chunk)
+
+        print(f"Chunks before timeout: {chunks}")
+        assert chunks == []
+        mock_estimate.assert_not_called()
+        stalled.aclose.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_retry_after_stalled_attempt_emits_single_message_start(
+        self, mock_model_cache, mock_auth_manager, kiro_stream_response_factory
+    ):
+        """
+        What it does: Recovers from a stalled first attempt with one valid event sequence.
+        Purpose: Exactly one message_start, first in the stream, carrying the estimate.
+        """
+        stalled = kiro_stream_response_factory(stall=True)
+        healthy = kiro_stream_response_factory(self.HEALTHY_CHUNKS)
+        make_request = AsyncMock(return_value=healthy)
+
+        chunks = []
+        with patch(
+            "kiro.streaming_anthropic.estimate_request_tokens", return_value={"total_tokens": 321}
+        ) as mock_estimate:
+            async for chunk in stream_with_first_token_retry_anthropic(
+                make_request=make_request,
+                model="claude-sonnet-4.5",
+                model_cache=mock_model_cache,
+                auth_manager=mock_auth_manager,
+                initial_response=stalled,
+                max_retries=3,
+                first_token_timeout=0.05,
+                request_messages=[{"role": "user", "content": "hi"}],
+            ):
+                chunks.append(chunk)
+
+        names = _sse_event_names(chunks)
+        print(f"Event names: {names}")
+        assert make_request.await_count == 1
+        assert names[0] == "message_start"
+        assert names.count("message_start") == 1
+        assert names.count("message_stop") == 1
+        assert names[-1] == "message_stop"
+        # Estimation ran once, for the attempt that actually streamed.
+        assert mock_estimate.call_count == 1
+        message_start = json.loads(chunks[0].split("data: ", 1)[1])
+        assert message_start["message"]["usage"]["input_tokens"] == 321
+
+    @pytest.mark.asyncio
+    async def test_empty_upstream_stream_still_starts_with_message_start(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Emits message_start, message_delta, message_stop for a stream without events.
+        Purpose: Deferral must not drop the opening when Kiro sends nothing.
+        """
+        async def no_events(*args, **kwargs):
+            return
+            yield  # pragma: no cover - makes this an async generator
+
+        chunks = []
+        with patch("kiro.streaming_anthropic.parse_kiro_stream", no_events):
+            with patch("kiro.streaming_anthropic.parse_bracket_tool_calls", return_value=[]):
+                async for chunk in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4.5", mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+
+        names = _sse_event_names(chunks)
+        print(f"Event names: {names}")
+        assert names == ["message_start", "message_delta", "message_stop"]
+
+    @pytest.mark.asyncio
+    async def test_message_start_precedes_first_block_for_every_event_kind(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Keeps message_start first even when the first event is usage-only or a tool call.
+        Purpose: Anthropic streaming requires message_start before any content block.
+        """
+        first_events = [
+            KiroEvent(type="usage", usage={"credits": 1}),
+            KiroEvent(type="context_usage", context_usage_percentage=1.0),
+            KiroEvent(type="tool_use", tool_use={"id": "toolu_1", "function": {"name": "Read", "arguments": "{}"}}),
+            KiroEvent(type="thinking", thinking_content="hmm"),
+        ]
+        for first in first_events:
+            async def events(*args, **kwargs):
+                yield first
+                yield KiroEvent(type="content", content="x")
+
+            chunks = []
+            with patch("kiro.streaming_anthropic.parse_kiro_stream", events):
+                with patch("kiro.streaming_anthropic.parse_bracket_tool_calls", return_value=[]):
+                    async for chunk in stream_kiro_to_anthropic(
+                        mock_response, "claude-sonnet-4.5", mock_model_cache, mock_auth_manager
+                    ):
+                        chunks.append(chunk)
+
+            names = _sse_event_names(chunks)
+            print(f"First event {first.type}: {names[:3]}")
+            assert names[0] == "message_start"
+            assert names.count("message_start") == 1

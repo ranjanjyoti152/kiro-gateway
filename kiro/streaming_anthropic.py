@@ -41,6 +41,7 @@ from fastapi import HTTPException
 from loguru import logger
 
 from kiro.streaming_core import (
+    DeferredPreamble,
     parse_kiro_stream,
     collect_stream_to_result,
     FirstTokenTimeoutError,
@@ -174,15 +175,47 @@ async def stream_kiro_to_anthropic(
     # Accuracy: ~85-90% (acceptable trade-off for maintaining streaming capability).
     # See: https://docs.anthropic.com/en/api/messages-streaming
     
-    # Fallback estimation must cover messages/tools/system to avoid significant undercount
-    if request_messages or request_tools or request_system:
-        request_token_stats = estimate_request_tokens(
-            messages=request_messages or [],
-            tools=request_tools,
-            system_prompt=request_system,
-            apply_claude_correction=False
-        )
-        input_tokens = request_token_stats["total_tokens"]
+    def build_message_start() -> List[str]:
+        """
+        Build the message_start frame, estimating input tokens on demand.
+
+        Runs only once the upstream stream has produced its first event, so an
+        attempt that hits the first-token timeout neither pays for token
+        estimation nor exposes message_start to the client.
+
+        Returns:
+            Single-element list with the message_start SSE frame.
+        """
+        nonlocal input_tokens
+        # Fallback estimation must cover messages/tools/system to avoid significant undercount
+        if request_messages or request_tools or request_system:
+            request_token_stats = estimate_request_tokens(
+                messages=request_messages or [],
+                tools=request_tools,
+                system_prompt=request_system,
+                apply_claude_correction=False
+            )
+            input_tokens = request_token_stats["total_tokens"]
+        return [format_sse_event("message_start", {
+            "type": "message_start",
+            "message": {
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": model,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": 0
+                }
+            }
+        })]
+    
+    # message_start is withheld until the first upstream event arrives, so a
+    # first-token timeout can be retried without a duplicate message_start.
+    message_start = DeferredPreamble(build_message_start)
     
     # Track content blocks - thinking block is index 0, text block is index 1 (when thinking enabled)
     current_block_index = 0
@@ -204,25 +237,10 @@ async def stream_kiro_to_anthropic(
     truncated_tools: List[Dict[str, Any]] = []
     
     try:
-        # Send message_start event
-        yield format_sse_event("message_start", {
-            "type": "message_start",
-            "message": {
-                "id": message_id,
-                "type": "message",
-                "role": "assistant",
-                "content": [],
-                "model": model,
-                "stop_reason": None,
-                "stop_sequence": None,
-                "usage": {
-                    "input_tokens": input_tokens,
-                    "output_tokens": 0
-                }
-            }
-        })
-        
         async for event in parse_kiro_stream(response, first_token_timeout):
+            for frame in message_start.release():
+                yield frame
+            
             if event.type == "content":
                 content = event.content or ""
                 full_content += content
@@ -524,6 +542,10 @@ async def stream_kiro_to_anthropic(
                 context_usage_percentage = event.context_usage_percentage
             elif event.type == "usage" and event.usage:
                 upstream_cache_usage.update(_extract_cache_usage_fields(event.usage))
+        
+        # An upstream stream without any event still opens with message_start.
+        for frame in message_start.release():
+            yield frame
         
         # Track completion signals for truncation detection
         stream_completed_normally = context_usage_percentage is not None

@@ -1302,6 +1302,169 @@ class TestFirstTokenRetryWrapper:
         assert "did not respond" in exc_info.value.detail
 
 
+def _data_events(frames):
+    """Parse the ``data:`` payloads of SSE frames into dicts."""
+    events = []
+    for frame in frames:
+        for line in frame.splitlines():
+            if line.startswith("data:"):
+                events.append(json.loads(line[5:].strip()))
+    return events
+
+
+class TestLifecycleOpeningDeferral:
+    """
+    Tests that response.created / response.in_progress are withheld until the
+    upstream stream is usable, so first-token retries never duplicate them.
+    """
+
+    HEALTHY_CHUNKS = [
+        b'{"content":"Hello"}',
+        b'{"content":" world"}',
+        b'{"contextUsagePercentage":1.5}',
+    ]
+
+    @pytest.mark.asyncio
+    async def test_timed_out_attempt_emits_no_frames(
+        self, mock_http_client, mock_model_cache, mock_auth_manager, kiro_stream_response_factory
+    ):
+        """
+        What it does: Emits nothing when the first upstream chunk never arrives.
+        Purpose: A timed-out attempt must be invisible to the client so it can be retried.
+        """
+        stalled = kiro_stream_response_factory(stall=True)
+        frames = []
+
+        with pytest.raises(FirstTokenTimeoutError):
+            async for frame in stream_kiro_to_responses(
+                client=mock_http_client,
+                response=stalled,
+                model="m",
+                model_cache=mock_model_cache,
+                auth_manager=mock_auth_manager,
+                tool_registry=ToolRegistry(),
+                response_id="resp_test",
+                first_token_timeout=0.02,
+            ):
+                frames.append(frame)
+
+        print(f"Frames before timeout: {frames}")
+        assert frames == []
+        stalled.aclose.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_retry_after_stalled_attempt_opens_lifecycle_once(
+        self, mock_http_client, mock_model_cache, mock_auth_manager, kiro_stream_response_factory
+    ):
+        """
+        What it does: Recovers from a stalled first attempt with exactly one lifecycle opening.
+        Purpose: Codex CLI treats a second response.created as a corrupted stream.
+        """
+        stalled = kiro_stream_response_factory(stall=True)
+        healthy = kiro_stream_response_factory(self.HEALTHY_CHUNKS)
+        make_request = AsyncMock(return_value=healthy)
+
+        frames = []
+        async for frame in stream_responses_with_first_token_retry(
+            make_request=make_request,
+            client=mock_http_client,
+            model="m",
+            model_cache=mock_model_cache,
+            auth_manager=mock_auth_manager,
+            tool_registry=ToolRegistry(),
+            response_id="resp_test",
+            initial_response=stalled,
+            max_retries=3,
+            first_token_timeout=0.05,
+        ):
+            frames.append(frame)
+
+        events = _data_events(frames)
+        types = [event["type"] for event in events]
+        print(f"Event types: {types}")
+
+        assert make_request.await_count == 1
+        assert types[:2] == ["response.created", "response.in_progress"]
+        assert types.count("response.created") == 1
+        assert types.count("response.in_progress") == 1
+        assert types.count("response.completed") == 1
+        assert types[-1] == "response.completed"
+        assert [event["sequence_number"] for event in events] == list(range(len(events)))
+        text = "".join(e["delta"] for e in events if e["type"] == "response.output_text.delta")
+        assert text == "Hello world"
+
+    @pytest.mark.asyncio
+    async def test_abandoned_attempt_never_reaches_debug_buffer(
+        self, mock_http_client, mock_model_cache, mock_auth_manager, kiro_stream_response_factory
+    ):
+        """
+        What it does: Records response.created in the debug log exactly once after a retry.
+        Purpose: Debug captures must mirror what the client actually received.
+        """
+        recorded = []
+        fake_debug_logger = MagicMock()
+        fake_debug_logger.log_modified_chunk.side_effect = lambda chunk: recorded.append(chunk)
+
+        with patch("kiro.streaming_openai_responses.debug_logger", fake_debug_logger):
+            async for _ in stream_responses_with_first_token_retry(
+                make_request=AsyncMock(return_value=kiro_stream_response_factory(self.HEALTHY_CHUNKS)),
+                client=mock_http_client,
+                model="m",
+                model_cache=mock_model_cache,
+                auth_manager=mock_auth_manager,
+                tool_registry=ToolRegistry(),
+                response_id="resp_test",
+                initial_response=kiro_stream_response_factory(stall=True),
+                max_retries=2,
+                first_token_timeout=0.05,
+            ):
+                pass
+
+        created = [chunk for chunk in recorded if chunk.startswith(b"event: response.created")]
+        assert len(created) == 1
+
+    @pytest.mark.asyncio
+    async def test_empty_upstream_stream_still_opens_lifecycle(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Emits created, in_progress and completed for a stream without events.
+        Purpose: Deferral must not drop the lifecycle opening when Kiro sends nothing.
+        """
+        _, events = await collect_events(
+            kiro_events(), mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+        )
+        types = [event["type"] for event in events]
+        print(f"Event types: {types}")
+        assert types == ["response.created", "response.in_progress", "response.completed"]
+        assert [event["sequence_number"] for event in events] == [0, 1, 2]
+
+    @pytest.mark.asyncio
+    async def test_opening_precedes_first_item_for_every_event_kind(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Puts the lifecycle opening before items even when the first event
+                      is usage-only, reasoning or a tool call.
+        Purpose: Ordering is part of the Codex CLI decoder contract.
+        """
+        first_events = [
+            KiroEvent(type="usage", usage=1.0),
+            KiroEvent(type="context_usage", context_usage_percentage=2.0),
+            KiroEvent(type="thinking", thinking_content="hmm"),
+            KiroEvent(type="tool_use", tool_use={"id": "call_1", "function": {"name": "exec_command", "arguments": "{}"}}),
+        ]
+        for first in first_events:
+            _, events = await collect_events(
+                kiro_events(first, KiroEvent(type="content", content="x")),
+                mock_http_client, mock_response, mock_model_cache, mock_auth_manager,
+            )
+            types = [event["type"] for event in events]
+            print(f"First event {first.type}: {types[:3]}")
+            assert types[:2] == ["response.created", "response.in_progress"]
+            assert types.count("response.created") == 1
+
+
 # =============================================================================
 # Non-streaming collection
 # =============================================================================

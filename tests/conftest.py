@@ -390,6 +390,42 @@ def mock_httpx_response():
     return _create_response
 
 
+@pytest.fixture
+def kiro_stream_response_factory():
+    """
+    Factory for upstream Kiro responses with a real byte stream.
+
+    Unlike AsyncMock responses, these drive the real ``parse_kiro_stream``, so
+    first-token timeouts happen exactly like in production. ``stall=True``
+    produces an HTTP 200 whose body never delivers a first chunk (a stuck
+    upstream connection); otherwise ``chunks`` are streamed in order.
+
+    Returns:
+        Callable ``(chunks=None, stall=False) -> response``. Each response has
+        ``status_code == 200``, an ``aclose`` AsyncMock and an
+        ``aiter_bytes_calls`` counter.
+    """
+    def _create(chunks: list = None, stall: bool = False):
+        response = Mock()
+        response.status_code = 200
+        response.aclose = AsyncMock()
+        response.aiter_bytes_calls = 0
+        body = list(chunks or [])
+
+        async def aiter_bytes():
+            response.aiter_bytes_calls += 1
+            if stall:
+                # Wait "forever"; the first-token timeout cancels this await.
+                await asyncio.Event().wait()
+            for chunk in body:
+                yield chunk
+
+        response.aiter_bytes = aiter_bytes
+        return response
+
+    return _create
+
+
 # =============================================================================
 # Global Network Blocking
 # =============================================================================

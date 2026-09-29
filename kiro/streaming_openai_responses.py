@@ -52,6 +52,10 @@ The emitted order for a response containing reasoning, text and tool calls is::
     response.output_item.done              (function_call)
     response.completed
 
+``response.created`` and ``response.in_progress`` are withheld until the first
+upstream event arrives, so a first-token timeout can be retried without the
+client ever receiving the lifecycle opening twice.
+
 Ordering is not cosmetic: the Codex CLI decoder reports
 ``OutputTextDelta without active item`` if a text delta arrives before the
 matching ``response.output_item.added``, so the item envelope is always opened
@@ -102,6 +106,7 @@ from kiro.models_openai_responses import (
 from kiro.network_errors import build_http_error_detail, classify_network_error
 from kiro.parsers import deduplicate_tool_calls, parse_bracket_tool_calls
 from kiro.streaming_core import (
+    DeferredPreamble,
     FirstTokenTimeoutError,
     calculate_tokens_from_context_usage,
     parse_kiro_stream,
@@ -520,23 +525,35 @@ async def stream_kiro_to_responses(
             }
         )
 
-    try:
-        yield format_responses_sse(
-            {
-                "type": "response.created",
-                "sequence_number": counter.next(),
-                "response": build_envelope("in_progress"),
-            }
-        )
-        yield format_responses_sse(
-            {
-                "type": "response.in_progress",
-                "sequence_number": counter.next(),
-                "response": build_envelope("in_progress"),
-            }
-        )
+    def build_lifecycle_preamble() -> List[str]:
+        """Build the ``response.created`` / ``response.in_progress`` frames."""
+        return [
+            format_responses_sse(
+                {
+                    "type": "response.created",
+                    "sequence_number": counter.next(),
+                    "response": build_envelope("in_progress"),
+                }
+            ),
+            format_responses_sse(
+                {
+                    "type": "response.in_progress",
+                    "sequence_number": counter.next(),
+                    "response": build_envelope("in_progress"),
+                }
+            ),
+        ]
 
+    # The lifecycle frames are withheld until the first upstream event arrives,
+    # so a first-token timeout can be retried without the client ever seeing
+    # ``response.created`` twice.
+    preamble = DeferredPreamble(build_lifecycle_preamble)
+
+    try:
         async for event in parse_kiro_stream(response, first_token_timeout):
+            for frame in preamble.release():
+                yield frame
+
             # ----------------------------------------------------------------
             # Thinking
             # ----------------------------------------------------------------
@@ -621,6 +638,10 @@ async def stream_kiro_to_responses(
         # ------------------------------------------------------------------
         # Stream finished: close open items
         # ------------------------------------------------------------------
+        # An upstream stream without any event still gets a complete lifecycle.
+        for frame in preamble.release():
+            yield frame
+
         for frame in close_reasoning_item():
             yield frame
 

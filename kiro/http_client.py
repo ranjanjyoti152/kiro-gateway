@@ -32,6 +32,9 @@ with connection pooling for better resource management.
 
 import asyncio
 import json
+import ssl
+import threading
+import time
 from typing import Optional
 
 import httpx
@@ -47,6 +50,60 @@ from kiro.network_errors import (
     build_http_error_detail,
     NetworkErrorInfo,
 )
+
+
+# ==================================================================================================
+# Shared TLS configuration
+# ==================================================================================================
+
+# Process-wide TLS context reused by every per-request client. Building an
+# SSLContext loads and parses the full CA bundle, which costs ~20 ms of CPU on
+# the event loop; streaming requests create one client each, so without reuse
+# every streaming request (and every account failover) paid that cost again.
+# An SSLContext holds configuration only, never connection state, so sharing it
+# keeps the per-request client isolation that prevents CLOSE_WAIT leaks.
+_shared_ssl_context: Optional[ssl.SSLContext] = None
+_shared_ssl_context_lock = threading.Lock()
+
+
+def get_shared_ssl_context() -> ssl.SSLContext:
+    """
+    Return the process-wide TLS context used by per-request HTTP clients.
+
+    The context is created lazily on first use with httpx defaults
+    (certificate verification enabled, ``SSL_CERT_FILE`` / ``SSL_CERT_DIR``
+    honored), so it verifies exactly like a freshly constructed
+    ``httpx.AsyncClient`` would.
+
+    Returns:
+        Shared ``ssl.SSLContext`` instance.
+
+    Raises:
+        ssl.SSLError: If the CA bundle cannot be loaded.
+        OSError: If a configured CA file or directory cannot be read.
+    """
+    global _shared_ssl_context
+    if _shared_ssl_context is None:
+        with _shared_ssl_context_lock:
+            if _shared_ssl_context is None:
+                started = time.perf_counter()
+                _shared_ssl_context = httpx.create_ssl_context(verify=True, trust_env=True)
+                logger.debug(
+                    f"Created shared TLS context for per-request clients "
+                    f"in {(time.perf_counter() - started) * 1000:.1f} ms"
+                )
+    return _shared_ssl_context
+
+
+def reset_shared_ssl_context() -> None:
+    """
+    Drop the cached TLS context so the next client builds a fresh one.
+
+    Intended for tests and for picking up a changed CA bundle without a restart.
+    """
+    global _shared_ssl_context
+    with _shared_ssl_context_lock:
+        _shared_ssl_context = None
 
 
 class KiroHttpClient:
@@ -147,7 +204,11 @@ class KiroHttpClient:
                 timeout_config = httpx.Timeout(timeout=300.0)
                 logger.debug("Creating non-streaming HTTP client (timeout=300s)")
             
-            self.client = httpx.AsyncClient(timeout=timeout_config, follow_redirects=True)
+            self.client = httpx.AsyncClient(
+                timeout=timeout_config,
+                follow_redirects=True,
+                verify=get_shared_ssl_context(),
+            )
         return self.client
     
     async def close(self) -> None:
@@ -229,6 +290,7 @@ class KiroHttpClient:
                 if params is not None:
                     request_kwargs["params"] = params
                 
+                send_started = time.monotonic()
                 if stream:
                     # Prevent CLOSE_WAIT connection leak (issue #38)
                     headers["Connection"] = "close"
@@ -238,6 +300,15 @@ class KiroHttpClient:
                 else:
                     logger.debug("Sending request to Kiro API...")
                     response = await client.request(method, url, **request_kwargs)
+                
+                # Kiro holds the response headers until the model starts
+                # generating, so this is the upstream time-to-first-token
+                # (plus connection setup), not gateway processing time.
+                logger.debug(
+                    f"Kiro API responded HTTP {response.status_code} after "
+                    f"{time.monotonic() - send_started:.3f}s "
+                    f"(attempt {attempt + 1}/{max_retries}, stream={stream})"
+                )
                 
                 # Check status
                 if response.status_code == 200:

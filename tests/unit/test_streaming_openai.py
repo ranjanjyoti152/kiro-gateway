@@ -1569,3 +1569,74 @@ class TestCollectStreamResponseConnectionDrop:
                         mock_http_client, mock_response, "claude-sonnet-4",
                         mock_model_cache, mock_auth_manager
                     )
+
+
+# ==================================================================================================
+# First-token retry consistency with the other API surfaces
+# ==================================================================================================
+
+class TestOpenaiFirstTokenRetryNoDuplicateOutput:
+    """
+    Tests that Chat Completions streaming exposes nothing from abandoned attempts.
+
+    Mirrors the Responses and Anthropic deferral tests so all three surfaces
+    share the same first-token retry contract.
+    """
+
+    @pytest.mark.asyncio
+    async def test_timed_out_attempt_emits_no_chunks(
+        self, mock_http_client, mock_model_cache, mock_auth_manager, kiro_stream_response_factory
+    ):
+        """
+        What it does: Emits nothing when the first upstream chunk never arrives.
+        Purpose: A timed-out attempt must be invisible so it can be retried safely.
+        """
+        stalled = kiro_stream_response_factory(stall=True)
+        chunks = []
+        with pytest.raises(FirstTokenTimeoutError):
+            async for chunk in stream_kiro_to_openai_internal(
+                mock_http_client, stalled, "claude-sonnet-4.5", mock_model_cache, mock_auth_manager,
+                first_token_timeout=0.02,
+            ):
+                chunks.append(chunk)
+        assert chunks == []
+
+    @pytest.mark.asyncio
+    async def test_retry_after_stalled_attempt_emits_one_role_chunk_and_one_done(
+        self, mock_http_client, mock_model_cache, mock_auth_manager, kiro_stream_response_factory
+    ):
+        """
+        What it does: Recovers from a stalled attempt with one assistant role chunk and one [DONE].
+        Purpose: Regression guard for duplicate output after a first-token retry.
+        """
+        stalled = kiro_stream_response_factory(stall=True)
+        healthy = kiro_stream_response_factory([
+            b'{"content":"Hello"}',
+            b'{"contextUsagePercentage":1.0}',
+        ])
+        make_request = AsyncMock(return_value=healthy)
+
+        chunks = []
+        async for chunk in stream_with_first_token_retry(
+            make_request=make_request,
+            client=mock_http_client,
+            model="claude-sonnet-4.5",
+            model_cache=mock_model_cache,
+            auth_manager=mock_auth_manager,
+            initial_response=stalled,
+            max_retries=3,
+            first_token_timeout=0.05,
+        ):
+            chunks.append(chunk)
+
+        payloads = [c[len("data: "):].strip() for c in chunks if c.startswith("data: ")]
+        role_chunks = [
+            p for p in payloads
+            if p != "[DONE]" and json.loads(p)["choices"]
+            and json.loads(p)["choices"][0].get("delta", {}).get("role") == "assistant"
+        ]
+        print(f"Payload count: {len(payloads)}, role chunks: {len(role_chunks)}")
+        assert make_request.await_count == 1
+        assert len(role_chunks) == 1
+        assert payloads.count("[DONE]") == 1
+        assert payloads[-1] == "[DONE]"

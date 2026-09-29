@@ -374,11 +374,13 @@ LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
 # First Token Timeout Settings (Streaming Retry)
 # ==================================================================================================
 
-# Timeout for waiting for the first token from the model (in seconds).
-# If the model doesn't respond within this time, the request will be cancelled and retried.
-# This helps handle "stuck" requests when the model takes too long to think.
-# Default: 30 seconds (recommended for production)
-# Set a lower value (e.g., 10-15) for more aggressive retry.
+# Timeout for waiting for the first response bytes after Kiro returned HTTP headers (in seconds).
+# If no bytes arrive within this time, the request is cancelled and retried.
+# Kiro holds the response headers until the model starts generating, so prompt
+# processing time for large contexts is spent BEFORE this timer starts (bounded by
+# STREAMING_READ_TIMEOUT); this timer only catches connections that stall after headers.
+# Default: 15 seconds (recommended for production)
+# Set a lower value (e.g., 5-10) for more aggressive retry.
 FIRST_TOKEN_TIMEOUT: float = float(os.getenv("FIRST_TOKEN_TIMEOUT", "15"))
 
 # Read timeout for streaming responses (in seconds).

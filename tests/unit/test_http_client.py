@@ -14,7 +14,9 @@ from datetime import datetime, timezone, timedelta
 import httpx
 from fastapi import HTTPException
 
-from kiro.http_client import KiroHttpClient
+import ssl
+
+from kiro.http_client import KiroHttpClient, get_shared_ssl_context, reset_shared_ssl_context
 from kiro.auth import KiroAuthManager
 from kiro.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, STREAMING_READ_TIMEOUT
 
@@ -1281,3 +1283,189 @@ class TestKiroHttpClientRequestParameters:
         assert captured_kwargs["params"]["filter"] == "active"
         assert json.loads(captured_kwargs["content"])["data"] == "value"
         assert response.status_code == 200
+
+
+# ==================================================================================================
+# Shared TLS context for per-request clients
+# ==================================================================================================
+
+class TestSharedSslContext:
+    """
+    Tests for the process-wide TLS context reused by per-request clients.
+
+    Building an SSLContext loads the full CA bundle (~20 ms of event-loop CPU);
+    streaming requests create one client each, so the context must be built once.
+    """
+
+    @pytest.fixture(autouse=True)
+    def fresh_context(self):
+        """Start and finish every test with an empty TLS context cache."""
+        reset_shared_ssl_context()
+        yield
+        reset_shared_ssl_context()
+
+    def test_returns_same_verifying_context(self):
+        """
+        What it does: Returns one cached SSLContext with verification enabled.
+        Purpose: Reuse must not weaken certificate or hostname verification.
+        """
+        first = get_shared_ssl_context()
+        second = get_shared_ssl_context()
+        print(f"verify_mode={first.verify_mode}, check_hostname={first.check_hostname}")
+        assert first is second
+        assert isinstance(first, ssl.SSLContext)
+        assert first.verify_mode == ssl.CERT_REQUIRED
+        assert first.check_hostname is True
+
+    def test_reset_builds_a_new_context(self):
+        """
+        What it does: Builds a new context after reset_shared_ssl_context().
+        Purpose: A changed CA bundle can be picked up without a restart.
+        """
+        first = get_shared_ssl_context()
+        reset_shared_ssl_context()
+        second = get_shared_ssl_context()
+        assert first is not second
+
+    def test_context_is_built_once_under_concurrent_first_use(self):
+        """
+        What it does: Builds the context exactly once when many threads race on first use.
+        Purpose: The lazy initialisation must be thread-safe.
+        """
+        import threading
+        import time as time_module
+
+        sentinel = ssl.create_default_context()
+
+        def slow_create(**kwargs):
+            time_module.sleep(0.02)
+            return sentinel
+
+        results = []
+        with patch("kiro.http_client.httpx.create_ssl_context", side_effect=slow_create) as mock_create:
+            threads = [threading.Thread(target=lambda: results.append(get_shared_ssl_context())) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        print(f"create_ssl_context calls: {mock_create.call_count}")
+        assert mock_create.call_count == 1
+        assert all(result is sentinel for result in results)
+        assert mock_create.call_args.kwargs == {"verify": True, "trust_env": True}
+
+    def test_failed_creation_propagates_and_is_retried_next_time(self):
+        """
+        What it does: Propagates an SSL error and retries on the next call.
+        Purpose: A transient CA read failure must not be cached forever.
+        """
+        sentinel = ssl.create_default_context()
+        with patch(
+            "kiro.http_client.httpx.create_ssl_context",
+            side_effect=[ssl.SSLError("bad bundle"), sentinel],
+        ):
+            with pytest.raises(ssl.SSLError):
+                get_shared_ssl_context()
+            assert get_shared_ssl_context() is sentinel
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [True, False])
+    async def test_per_request_clients_share_the_context(self, mock_auth_manager_for_http, stream):
+        """
+        What it does: Passes the shared context to every per-request client (streaming and not).
+        Purpose: Clients stay per-request (CLOSE_WAIT safety) but skip the CA reload.
+        """
+        with patch("kiro.http_client.httpx.AsyncClient") as mock_async_client:
+            mock_async_client.return_value = AsyncMock(is_closed=False)
+            await KiroHttpClient(mock_auth_manager_for_http)._get_client(stream=stream)
+            await KiroHttpClient(mock_auth_manager_for_http)._get_client(stream=stream)
+
+        verify_args = [call.kwargs.get("verify") for call in mock_async_client.call_args_list]
+        print(f"AsyncClient constructions: {len(verify_args)}")
+        assert len(verify_args) == 2
+        assert verify_args[0] is verify_args[1]
+        assert verify_args[0] is get_shared_ssl_context()
+
+    @pytest.mark.asyncio
+    async def test_shared_client_mode_does_not_build_a_context(self, mock_auth_manager_for_http):
+        """
+        What it does: Leaves the TLS context untouched when a shared client is injected.
+        Purpose: The application-level pooled client owns its own configuration.
+        """
+        shared = AsyncMock()
+        with patch("kiro.http_client.httpx.create_ssl_context") as mock_create:
+            client = await KiroHttpClient(mock_auth_manager_for_http, shared_client=shared)._get_client(stream=True)
+        assert client is shared
+        mock_create.assert_not_called()
+
+
+class TestTimeToHeadersDiagnostics:
+    """Tests for the upstream time-to-headers debug log in request_with_retry()."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [True, False])
+    async def test_logs_upstream_latency_per_attempt(self, mock_auth_manager_for_http, stream):
+        """
+        What it does: Logs status, elapsed time, attempt number and mode for each upstream response.
+        Purpose: Operators can separate upstream time-to-first-token from gateway overhead.
+        """
+        from loguru import logger
+
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.build_request = Mock(return_value=Mock())
+        mock_client.send = AsyncMock(return_value=mock_response)
+        mock_client.request = AsyncMock(return_value=mock_response)
+
+        messages = []
+        sink_id = logger.add(lambda m: messages.append(m.record["message"]), level="DEBUG")
+        try:
+            with patch("kiro.http_client.httpx.AsyncClient", return_value=mock_client):
+                with patch("kiro.http_client.get_kiro_headers", return_value={}):
+                    await KiroHttpClient(mock_auth_manager_for_http).request_with_retry(
+                        "POST", "https://api.example.com/test", {"a": 1}, stream=stream
+                    )
+        finally:
+            logger.remove(sink_id)
+
+        timing = [m for m in messages if m.startswith("Kiro API responded HTTP 200 after")]
+        print(f"Timing logs: {timing}")
+        assert len(timing) == 1
+        assert f"attempt 1/{FIRST_TOKEN_MAX_RETRIES if stream else MAX_RETRIES}" in timing[0]
+        assert f"stream={stream}" in timing[0]
+
+    @pytest.mark.asyncio
+    async def test_logs_every_retried_attempt(self, mock_auth_manager_for_http):
+        """
+        What it does: Logs one timing line per upstream response, including retried 5xx.
+        Purpose: Backoff retries must be visible when diagnosing slow requests.
+        """
+        from loguru import logger
+
+        error_response = AsyncMock(status_code=503)
+        ok_response = AsyncMock(status_code=200)
+        mock_client = AsyncMock()
+        mock_client.is_closed = False
+        mock_client.build_request = Mock(return_value=Mock())
+        mock_client.send = AsyncMock(side_effect=[error_response, ok_response])
+
+        messages = []
+        sink_id = logger.add(lambda m: messages.append(m.record["message"]), level="DEBUG")
+        try:
+            with patch("kiro.http_client.httpx.AsyncClient", return_value=mock_client):
+                with patch("kiro.http_client.get_kiro_headers", return_value={}):
+                    with patch("kiro.http_client.asyncio.sleep", new_callable=AsyncMock):
+                        await KiroHttpClient(mock_auth_manager_for_http).request_with_retry(
+                            "POST", "https://api.example.com/test", {"a": 1}, stream=True
+                        )
+        finally:
+            logger.remove(sink_id)
+
+        timing = [m for m in messages if m.startswith("Kiro API responded HTTP")]
+        print(f"Timing logs: {timing}")
+        assert [t.split(" after")[0] for t in timing] == [
+            "Kiro API responded HTTP 503",
+            "Kiro API responded HTTP 200",
+        ]

@@ -25,12 +25,14 @@ This module contains shared logic used by both OpenAI and Anthropic streaming:
 - Kiro SSE stream parsing
 - Full response collection
 - First token timeout handling
+- Deferred opening frames, so first-token retries never duplicate output
 
 The core layer provides a unified interface that API-specific formatters use
 to convert Kiro events to their respective SSE formats.
 """
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Awaitable, Dict, List, Optional, Tuple
 
@@ -109,6 +111,67 @@ class StreamResult:
 class FirstTokenTimeoutError(Exception):
     """Exception raised when first token timeout occurs."""
     pass
+
+
+class DeferredPreamble:
+    """
+    Client-visible opening frames withheld until the upstream stream is usable.
+
+    Streaming surfaces open their protocol with frames that do not depend on
+    model output (``response.created`` / ``response.in_progress`` for the
+    Responses API, ``message_start`` for Anthropic). If those frames are sent
+    before the first upstream chunk arrives, a first-token timeout followed by
+    a retry makes the client see the opening frames twice, which clients treat
+    as a corrupted stream.
+
+    Surfaces therefore hand the opening frames to this holder and release them
+    only when the first Kiro event arrives (or when the stream ends empty).
+    The builder runs lazily on release, so any expensive preparation it does
+    (for example token estimation) is skipped for attempts that time out.
+
+    Attributes:
+        released: Whether the frames have already been handed out.
+
+    Examples:
+        >>> preamble = DeferredPreamble(lambda: ["opening"])
+        >>> preamble.release()
+        ['opening']
+        >>> preamble.release()
+        []
+    """
+
+    def __init__(self, build_frames: Callable[[], List[str]]) -> None:
+        """
+        Initialize the holder.
+
+        Args:
+            build_frames: Callable returning the opening frames. Invoked at most
+                once, on the first call to ``release()``.
+        """
+        self._build_frames = build_frames
+        self._released: bool = False
+
+    @property
+    def released(self) -> bool:
+        """
+        Report whether the opening frames were already released.
+
+        Returns:
+            True once ``release()`` has been called.
+        """
+        return self._released
+
+    def release(self) -> List[str]:
+        """
+        Hand out the opening frames exactly once.
+
+        Returns:
+            The opening frames on the first call, an empty list afterwards.
+        """
+        if self._released:
+            return []
+        self._released = True
+        return self._build_frames()
 
 
 # ==================================================================================================
@@ -384,6 +447,14 @@ async def stream_with_first_token_retry(
     This is seamless for user - they just see a delay,
     but eventually get a response (or error after all attempts).
     
+    Retries are only safe while nothing has reached the client. Once the
+    stream processor has yielded a frame for the current attempt, the output
+    is committed: a later FirstTokenTimeoutError is re-raised instead of
+    retried, because a new attempt would replay the opening frames and
+    duplicate client-visible output. Stream processors keep retries possible
+    by withholding their opening frames until the first upstream event
+    (see ``DeferredPreamble``).
+    
     Args:
         make_request: Function to create new HTTP request (returns httpx.Response)
         stream_processor: Function that processes response and yields SSE strings.
@@ -418,9 +489,14 @@ async def stream_with_first_token_retry(
         ...     print(chunk)
     """
     last_error: Optional[Exception] = None
+    # Seconds spent on attempts that timed out and were abandoned.
+    wasted_seconds = 0.0
     
     for attempt in range(max_retries):
         response: Optional[httpx.Response] = None
+        attempt_started = time.monotonic()
+        # Frames delivered to the client by this attempt (output-commit boundary).
+        frames_delivered = 0
         try:
             # Make request
             if attempt > 0:
@@ -455,17 +531,25 @@ async def stream_with_first_token_retry(
             
             # Try to stream with first token timeout
             async for chunk in stream_processor(response):
+                if frames_delivered == 0:
+                    logger.debug(
+                        f"[FirstToken] Attempt {attempt + 1}/{max_retries}: first frame "
+                        f"after {time.monotonic() - attempt_started:.3f}s"
+                    )
+                frames_delivered += 1
                 yield chunk
+            
+            if attempt > 0:
+                logger.info(
+                    f"[FirstTokenTimeout] Recovered on attempt {attempt + 1}/{max_retries}; "
+                    f"{wasted_seconds:.1f}s were spent on timed-out attempts"
+                )
             
             # Successfully completed - exit
             return
             
         except FirstTokenTimeoutError as e:
             last_error = e
-            logger.warning(
-                f"[FirstTokenTimeout] Attempt {attempt + 1}/{max_retries} failed - "
-                f"model did not respond within {first_token_timeout}s"
-            )
             
             # Close current response if open
             if response:
@@ -473,6 +557,23 @@ async def stream_with_first_token_retry(
                     await response.aclose()
                 except Exception:
                     pass
+            
+            if frames_delivered > 0:
+                # Output is committed: a retry would replay the opening frames
+                # and duplicate what the client has already received.
+                logger.error(
+                    f"[FirstTokenTimeout] Attempt {attempt + 1}/{max_retries} timed out after "
+                    f"{frames_delivered} frame(s) were already delivered to the client; "
+                    f"not retrying because a new attempt would duplicate client-visible output"
+                )
+                raise
+            
+            wasted_seconds += time.monotonic() - attempt_started
+            logger.warning(
+                f"[FirstTokenTimeout] Attempt {attempt + 1}/{max_retries} failed - "
+                f"model did not respond within {first_token_timeout}s "
+                f"(total time lost to timed-out attempts: {wasted_seconds:.1f}s)"
+            )
             
             # Continue to next attempt
             continue
@@ -493,7 +594,8 @@ async def stream_with_first_token_retry(
     # All attempts exhausted - raise error
     logger.error(
         f"[FirstTokenTimeout] All {max_retries} attempts exhausted - "
-        f"model never responded within {first_token_timeout}s per attempt"
+        f"model never responded within {first_token_timeout}s per attempt "
+        f"({wasted_seconds:.1f}s spent in total)"
     )
     
     if on_all_retries_failed:

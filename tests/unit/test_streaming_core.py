@@ -11,6 +11,7 @@ Tests for:
 - parse_kiro_stream() function
 - collect_stream_to_result() function
 - calculate_tokens_from_context_usage() function
+- DeferredPreamble and the first-token retry output-commit boundary
 """
 
 import pytest
@@ -18,7 +19,11 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 from dataclasses import asdict
 
+from hypothesis import given, settings, strategies as st
+from loguru import logger
+
 from kiro.streaming_core import (
+    DeferredPreamble,
     KiroEvent,
     StreamResult,
     FirstTokenTimeoutError,
@@ -1832,3 +1837,403 @@ class TestStreamWithFirstTokenRetryCore:
         assert make_request_call_count == 1
         assert len(chunks) == 1
         print("✓ make_request called immediately when initial_response is None")
+
+
+# ==================================================================================================
+# DeferredPreamble
+# ==================================================================================================
+
+class TestDeferredPreamble:
+    """Tests for DeferredPreamble (opening frames withheld until the stream is usable)."""
+
+    def test_release_returns_frames_once(self):
+        """
+        What it does: Releases the opening frames on the first call only.
+        Purpose: A second release must never duplicate client-visible output.
+        """
+        print("Setup: Preamble with two frames...")
+        preamble = DeferredPreamble(lambda: ["open-1", "open-2"])
+
+        print("Action: Releasing twice...")
+        first = preamble.release()
+        second = preamble.release()
+
+        print(f"First: {first}, second: {second}")
+        assert first == ["open-1", "open-2"]
+        assert second == []
+
+    def test_builder_is_lazy(self):
+        """
+        What it does: Does not call the builder before release().
+        Purpose: Expensive preparation (token estimation) must be skipped for
+                 attempts that time out before the first upstream event.
+        """
+        print("Setup: Builder that counts invocations...")
+        calls = []
+        preamble = DeferredPreamble(lambda: calls.append(1) or ["open"])
+
+        print(f"Builder calls before release: {len(calls)}")
+        assert calls == []
+        assert preamble.released is False
+
+    def test_builder_called_exactly_once_across_many_releases(self):
+        """
+        What it does: Calls the builder a single time no matter how often release() runs.
+        Purpose: Surfaces call release() on every event; the frames must be built once.
+        """
+        print("Setup: Counting builder...")
+        calls = []
+        preamble = DeferredPreamble(lambda: calls.append(1) or ["open"])
+
+        print("Action: Releasing 50 times...")
+        released = [frame for _ in range(50) for frame in preamble.release()]
+
+        print(f"Builder calls: {len(calls)}, frames: {released}")
+        assert len(calls) == 1
+        assert released == ["open"]
+
+    def test_released_property_transitions(self):
+        """
+        What it does: Reports released=False before and True after release().
+        Purpose: Callers can check whether the protocol has already opened.
+        """
+        preamble = DeferredPreamble(lambda: ["open"])
+        assert preamble.released is False
+        preamble.release()
+        assert preamble.released is True
+
+    def test_empty_builder_marks_released(self):
+        """
+        What it does: Handles a builder that returns no frames.
+        Purpose: Boundary case - an empty preamble is still released exactly once.
+        """
+        calls = []
+        preamble = DeferredPreamble(lambda: calls.append(1) or [])
+        assert preamble.release() == []
+        assert preamble.release() == []
+        assert preamble.released is True
+        assert len(calls) == 1
+
+    def test_builder_error_propagates_and_is_not_rebuilt(self):
+        """
+        What it does: Propagates a builder error and never re-runs the builder.
+        Purpose: A failing preamble must fail the stream once instead of being
+                 half-emitted repeatedly.
+        """
+        calls = []
+
+        def failing_builder():
+            calls.append(1)
+            raise ValueError("cannot build")
+
+        preamble = DeferredPreamble(failing_builder)
+        with pytest.raises(ValueError, match="cannot build"):
+            preamble.release()
+        assert preamble.release() == []
+        assert len(calls) == 1
+
+
+# ==================================================================================================
+# First-token retry: output-commit boundary
+# ==================================================================================================
+
+def _content_chunk(text: str) -> bytes:
+    """Build one Kiro content event as raw bytes."""
+    return ('{"content":"' + text + '"}').encode("utf-8")
+
+
+def _surface_like_processor(first_token_timeout: float):
+    """
+    Build a stream processor that behaves like a real API surface.
+
+    It parses the upstream body with the real parse_kiro_stream and withholds
+    its opening frame with DeferredPreamble, exactly like the Responses and
+    Anthropic surfaces do.
+    """
+    async def processor(response):
+        preamble = DeferredPreamble(lambda: ["open"])
+        async for event in parse_kiro_stream(response, first_token_timeout, enable_thinking_parser=False):
+            for frame in preamble.release():
+                yield frame
+            if event.type == "content":
+                yield f"content:{event.content}"
+        for frame in preamble.release():
+            yield frame
+        yield "close"
+
+    return processor
+
+
+class TestFirstTokenRetryOutputCommitBoundary:
+    """
+    Tests that first-token retries never duplicate client-visible output.
+
+    A retry is only safe while the current attempt has not delivered a frame.
+    """
+
+    @pytest.mark.asyncio
+    async def test_timeout_after_delivered_frame_is_not_retried(self):
+        """
+        What it does: Re-raises a first-token timeout that happens after a frame was delivered.
+        Purpose: Retrying would replay the opening frame and duplicate output.
+        """
+        print("Setup: Processor that yields a frame, then times out...")
+        initial = AsyncMock()
+        initial.status_code = 200
+        initial.aclose = AsyncMock()
+        make_request = AsyncMock()
+
+        async def processor(response):
+            yield "opening"
+            raise FirstTokenTimeoutError("late timeout")
+
+        chunks = []
+        print("Action: Streaming...")
+        with pytest.raises(FirstTokenTimeoutError, match="late timeout"):
+            async for chunk in stream_with_first_token_retry(
+                make_request=make_request,
+                stream_processor=processor,
+                initial_response=initial,
+                max_retries=3,
+                first_token_timeout=5,
+            ):
+                chunks.append(chunk)
+
+        print(f"Chunks: {chunks}, make_request calls: {make_request.await_count}")
+        assert chunks == ["opening"]
+        assert make_request.await_count == 0
+        initial.aclose.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_committed_timeout_does_not_report_exhaustion(self):
+        """
+        What it does: Skips on_all_retries_failed when output is already committed.
+        Purpose: The client must not receive a misleading "all attempts exhausted" error.
+        """
+        initial = AsyncMock()
+        initial.status_code = 200
+        initial.aclose = AsyncMock()
+        exhausted = MagicMock(return_value=RuntimeError("exhausted"))
+
+        async def processor(response):
+            yield "opening"
+            raise FirstTokenTimeoutError("late timeout")
+
+        with pytest.raises(FirstTokenTimeoutError):
+            async for _ in stream_with_first_token_retry(
+                make_request=AsyncMock(),
+                stream_processor=processor,
+                initial_response=initial,
+                max_retries=3,
+                first_token_timeout=5,
+                on_all_retries_failed=exhausted,
+            ):
+                pass
+
+        exhausted.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_retry_then_committed_timeout_stops(self):
+        """
+        What it does: Retries a clean timeout, then stops once the next attempt has delivered output.
+        Purpose: The commit boundary is tracked per attempt, not per request.
+        """
+        print("Setup: attempt 1 times out cleanly, attempt 2 yields then times out...")
+        attempts = []
+
+        async def make_request():
+            response = AsyncMock()
+            response.status_code = 200
+            response.aclose = AsyncMock()
+            return response
+
+        async def processor(response):
+            attempts.append(response)
+            if len(attempts) == 1:
+                raise FirstTokenTimeoutError("clean timeout")
+            yield "opening"
+            raise FirstTokenTimeoutError("late timeout")
+
+        chunks = []
+        with pytest.raises(FirstTokenTimeoutError, match="late timeout"):
+            async for chunk in stream_with_first_token_retry(
+                make_request=make_request,
+                stream_processor=processor,
+                max_retries=5,
+                first_token_timeout=5,
+            ):
+                chunks.append(chunk)
+
+        print(f"Attempts: {len(attempts)}, chunks: {chunks}")
+        assert len(attempts) == 2
+        assert chunks == ["opening"]
+
+    @pytest.mark.asyncio
+    async def test_stalled_attempt_then_success_emits_opening_once(self, kiro_stream_response_factory):
+        """
+        What it does: Recovers from a stalled upstream body without duplicating the opening frame.
+        Purpose: End-to-end check with the real parser and a real first-token timeout.
+        """
+        print("Setup: Stalled initial response, healthy retry response...")
+        stalled = kiro_stream_response_factory(stall=True)
+        healthy = kiro_stream_response_factory([_content_chunk("hello")])
+        make_request = AsyncMock(return_value=healthy)
+
+        chunks = []
+        async for chunk in stream_with_first_token_retry(
+            make_request=make_request,
+            stream_processor=_surface_like_processor(0.05),
+            initial_response=stalled,
+            max_retries=3,
+            first_token_timeout=0.05,
+        ):
+            chunks.append(chunk)
+
+        print(f"Chunks: {chunks}")
+        assert chunks == ["open", "content:hello", "close"]
+        assert make_request.await_count == 1
+        stalled.aclose.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_single_attempt_budget_exhausts_immediately(self, kiro_stream_response_factory):
+        """
+        What it does: Raises the exhaustion error after one stalled attempt when max_retries=1.
+        Purpose: Boundary value - no retry is made and nothing reaches the client.
+        """
+        stalled = kiro_stream_response_factory(stall=True)
+        make_request = AsyncMock()
+        chunks = []
+
+        with pytest.raises(RuntimeError, match="1 attempts"):
+            async for chunk in stream_with_first_token_retry(
+                make_request=make_request,
+                stream_processor=_surface_like_processor(0.02),
+                initial_response=stalled,
+                max_retries=1,
+                first_token_timeout=0.02,
+                on_all_retries_failed=lambda n, t: RuntimeError(f"{n} attempts"),
+            ):
+                chunks.append(chunk)
+
+        assert chunks == []
+        assert make_request.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_zero_attempt_budget_raises_without_requests(self):
+        """
+        What it does: Raises the exhaustion error without any request when max_retries=0.
+        Purpose: Boundary value - a misconfigured budget must fail clearly, not hang.
+        """
+        make_request = AsyncMock()
+        with pytest.raises(RuntimeError, match="0 attempts"):
+            async for _ in stream_with_first_token_retry(
+                make_request=make_request,
+                stream_processor=_surface_like_processor(0.02),
+                max_retries=0,
+                first_token_timeout=0.02,
+                on_all_retries_failed=lambda n, t: RuntimeError(f"{n} attempts"),
+            ):
+                pass
+        assert make_request.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_recovery_and_exhaustion_logs_report_lost_time(self, kiro_stream_response_factory):
+        """
+        What it does: Logs the time lost to timed-out attempts on recovery and on exhaustion.
+        Purpose: Operators must be able to see how much latency first-token retries cost.
+        """
+        messages = []
+        sink_id = logger.add(lambda message: messages.append(message.record["message"]), level="INFO")
+        try:
+            print("Action: One stalled attempt followed by a successful one...")
+            async for _ in stream_with_first_token_retry(
+                make_request=AsyncMock(return_value=kiro_stream_response_factory([_content_chunk("ok")])),
+                stream_processor=_surface_like_processor(0.02),
+                initial_response=kiro_stream_response_factory(stall=True),
+                max_retries=3,
+                first_token_timeout=0.02,
+            ):
+                pass
+
+            print("Action: Every attempt stalls...")
+            with pytest.raises(Exception):
+                async for _ in stream_with_first_token_retry(
+                    make_request=AsyncMock(side_effect=lambda: kiro_stream_response_factory(stall=True)),
+                    stream_processor=_surface_like_processor(0.02),
+                    max_retries=2,
+                    first_token_timeout=0.02,
+                ):
+                    pass
+        finally:
+            logger.remove(sink_id)
+
+        print(f"Captured logs: {messages}")
+        assert any("Recovered on attempt 2/3" in m and "timed-out attempts" in m for m in messages)
+        assert any("total time lost to timed-out attempts" in m for m in messages)
+        assert any("All 2 attempts exhausted" in m and "spent in total" in m for m in messages)
+
+    @settings(max_examples=25, deadline=None, database=None)
+    @given(
+        max_retries=st.integers(min_value=1, max_value=4),
+        stalls=st.integers(min_value=0, max_value=4),
+        contents=st.lists(
+            st.text(alphabet="abcdefghij", min_size=1, max_size=6), min_size=1, max_size=5, unique=True
+        ),
+    )
+    def test_property_output_is_never_duplicated(self, max_retries, stalls, contents):
+        """
+        What it does: For any mix of stalled attempts and attempt budgets, the client
+                      receives either exactly one complete stream or nothing at all.
+        Purpose: Property check of the output-commit invariant across retry budgets.
+        """
+        timeout = 0.01
+        created = []
+
+        def build(stall: bool):
+            response = MagicMock()
+            response.status_code = 200
+            response.aclose = AsyncMock()
+            chunks = [_content_chunk(c) for c in contents]
+
+            async def aiter_bytes():
+                if stall:
+                    await asyncio.Event().wait()
+                for chunk in chunks:
+                    yield chunk
+
+            response.aiter_bytes = aiter_bytes
+            created.append(response)
+            return response
+
+        async def make_request():
+            return build(stall=len(created) < stalls)
+
+        async def run():
+            output = []
+            try:
+                async for chunk in stream_with_first_token_retry(
+                    make_request=make_request,
+                    stream_processor=_surface_like_processor(timeout),
+                    max_retries=max_retries,
+                    first_token_timeout=timeout,
+                    on_all_retries_failed=lambda n, t: RuntimeError("exhausted"),
+                ):
+                    output.append(chunk)
+            except RuntimeError:
+                return output, False
+            return output, True
+
+        output, succeeded = asyncio.run(run())
+
+        expected = ["open"] + [f"content:{c}" for c in contents] + ["close"]
+        if stalls < max_retries:
+            assert succeeded
+            assert output == expected
+            assert len(created) == stalls + 1
+        else:
+            assert not succeeded
+            assert output == []
+            assert len(created) == max_retries
+        # Every abandoned attempt was closed.
+        for response in created[:stalls]:
+            response.aclose.assert_awaited()
