@@ -34,6 +34,7 @@ import asyncio
 import json
 import ssl
 import threading
+import random
 import time
 from typing import Optional
 
@@ -41,7 +42,14 @@ import httpx
 from fastapi import HTTPException
 from loguru import logger
 
-from kiro.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, STREAMING_READ_TIMEOUT
+from kiro.config import (
+    MAX_RETRIES,
+    BASE_RETRY_DELAY,
+    FIRST_TOKEN_MAX_RETRIES,
+    STREAMING_READ_TIMEOUT,
+    SERVER_ERROR_MAX_RETRIES,
+    MAX_RETRY_DELAY,
+)
 from kiro.auth import KiroAuthManager
 from kiro.utils import get_kiro_headers
 from kiro.network_errors import (
@@ -50,6 +58,46 @@ from kiro.network_errors import (
     build_http_error_detail,
     NetworkErrorInfo,
 )
+
+
+# ==================================================================================================
+# Retry backoff helper
+# ==================================================================================================
+
+def compute_backoff_delay(
+    attempt: int,
+    base_delay: float = BASE_RETRY_DELAY,
+    max_delay: float = MAX_RETRY_DELAY,
+) -> float:
+    """
+    Compute an exponential backoff delay with full jitter, capped at ``max_delay``.
+
+    Exponential backoff lets a transiently overloaded upstream (e.g. Kiro/Amazon
+    returning HTTP 500 ``MODEL_TEMPORARILY_UNAVAILABLE``) recover between attempts,
+    while jitter prevents many concurrent clients from retrying in lockstep
+    ("thundering herd"). The delay is bounded so a long retry budget never
+    produces an unbounded wait.
+
+    Args:
+        attempt: Zero-based attempt index (0 for the first retry wait).
+        base_delay: Base delay in seconds before exponential growth.
+        max_delay: Upper bound in seconds for the returned delay.
+
+    Returns:
+        Delay in seconds in the range [0, capped_exponential_delay], where
+        capped_exponential_delay = min(base_delay * 2**attempt, max_delay).
+
+    Examples:
+        >>> # With base_delay=1.0, max_delay=30.0 the cap per attempt is:
+        >>> # attempt 0 -> up to 1s, 1 -> up to 2s, 2 -> up to 4s, ... capped at 30s
+        >>> 0.0 <= compute_backoff_delay(0, 1.0, 30.0) <= 1.0
+        True
+        >>> 0.0 <= compute_backoff_delay(10, 1.0, 30.0) <= 30.0
+        True
+    """
+    capped = min(base_delay * (2 ** attempt), max_delay)
+    # Full jitter: sample uniformly in [0, capped] to spread out retries.
+    return random.uniform(0.0, capped)
 
 
 # ==================================================================================================
@@ -266,9 +314,20 @@ class KiroHttpClient:
         Raises:
             HTTPException: On failure after all attempts (502/504)
         """
-        # Determine the number of retry attempts
-        # FIRST_TOKEN_TIMEOUT is used in streaming_openai.py, not here
-        max_retries = FIRST_TOKEN_MAX_RETRIES if stream else MAX_RETRIES
+        # Determine the number of retry attempts.
+        #
+        # Streaming: the HTTP client only opens the initial connection here; the
+        # first-token-timeout retry loop lives in the streaming layer, so we keep
+        # the streaming budget at FIRST_TOKEN_MAX_RETRIES and do NOT inflate it.
+        #
+        # Non-streaming: 429/5xx retries (including transient Amazon overload
+        # MODEL_TEMPORARILY_UNAVAILABLE) are handled right here, so we grant the
+        # larger SERVER_ERROR_MAX_RETRIES budget to let the backend recover before
+        # surfacing the error to the client.
+        if stream:
+            max_retries = FIRST_TOKEN_MAX_RETRIES
+        else:
+            max_retries = max(MAX_RETRIES, SERVER_ERROR_MAX_RETRIES)
         
         client = await self._get_client(stream=stream)
         last_error = None
@@ -322,17 +381,20 @@ class KiroHttpClient:
                 
                 # 429 - rate limit, wait and retry
                 if response.status_code == 429:
-                    last_response = response  # Сохраняем для возврата после exhaustion
-                    delay = BASE_RETRY_DELAY * (2 ** attempt)
-                    logger.warning(f"Received 429, waiting {delay}s (attempt {attempt + 1}/{max_retries})")
+                    last_response = response  # Keep for return after exhaustion
+                    delay = compute_backoff_delay(attempt)
+                    logger.warning(f"Received 429, waiting {delay:.1f}s (attempt {attempt + 1}/{max_retries})")
                     await asyncio.sleep(delay)
                     continue
                 
                 # 5xx - server error, wait and retry
+                # Transient upstream overload (e.g. MODEL_TEMPORARILY_UNAVAILABLE)
+                # usually clears within a few seconds; jittered exponential backoff
+                # with a larger budget gives it time to recover before failing.
                 if 500 <= response.status_code < 600:
-                    last_response = response  # Сохраняем для возврата после exhaustion
-                    delay = BASE_RETRY_DELAY * (2 ** attempt)
-                    logger.warning(f"Received {response.status_code}, waiting {delay}s (attempt {attempt + 1}/{max_retries})")
+                    last_response = response  # Keep for return after exhaustion
+                    delay = compute_backoff_delay(attempt)
+                    logger.warning(f"Received {response.status_code}, waiting {delay:.1f}s (attempt {attempt + 1}/{max_retries})")
                     await asyncio.sleep(delay)
                     continue
                 
@@ -350,8 +412,8 @@ class KiroHttpClient:
                 short_msg = get_short_error_message(error_info)
                 
                 if error_info.is_retryable and attempt < max_retries - 1:
-                    delay = BASE_RETRY_DELAY * (2 ** attempt)
-                    logger.warning(f"{short_msg} - waiting {delay}s (attempt {attempt + 1}/{max_retries})")
+                    delay = compute_backoff_delay(attempt)
+                    logger.warning(f"{short_msg} - waiting {delay:.1f}s (attempt {attempt + 1}/{max_retries})")
                     await asyncio.sleep(delay)
                 else:
                     logger.error(f"{short_msg} - no more retries (attempt {attempt + 1}/{max_retries})")
@@ -369,8 +431,8 @@ class KiroHttpClient:
                 short_msg = get_short_error_message(error_info)
                 
                 if error_info.is_retryable and attempt < max_retries - 1:
-                    delay = BASE_RETRY_DELAY * (2 ** attempt)
-                    logger.warning(f"{short_msg} - waiting {delay}s (attempt {attempt + 1}/{max_retries})")
+                    delay = compute_backoff_delay(attempt)
+                    logger.warning(f"{short_msg} - waiting {delay:.1f}s (attempt {attempt + 1}/{max_retries})")
                     await asyncio.sleep(delay)
                 else:
                     logger.error(f"{short_msg} - no more retries (attempt {attempt + 1}/{max_retries})")

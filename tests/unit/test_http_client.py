@@ -16,9 +16,20 @@ from fastapi import HTTPException
 
 import ssl
 
-from kiro.http_client import KiroHttpClient, get_shared_ssl_context, reset_shared_ssl_context
+from kiro.http_client import (
+    KiroHttpClient,
+    get_shared_ssl_context,
+    reset_shared_ssl_context,
+    compute_backoff_delay,
+)
 from kiro.auth import KiroAuthManager
-from kiro.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, STREAMING_READ_TIMEOUT
+from kiro.config import (
+    MAX_RETRIES,
+    BASE_RETRY_DELAY,
+    FIRST_TOKEN_MAX_RETRIES,
+    STREAMING_READ_TIMEOUT,
+    MAX_RETRY_DELAY,
+)
 
 
 @pytest.fixture
@@ -516,10 +527,11 @@ class TestKiroHttpClientExponentialBackoff:
     """Tests for exponential backoff logic."""
     
     @pytest.mark.asyncio
-    async def test_backoff_delay_increases_exponentially(self, mock_auth_manager_for_http):
+    async def test_backoff_delay_stays_within_jittered_bounds(self, mock_auth_manager_for_http):
         """
-        What it does: Verifies exponential delay increase.
-        Purpose: Ensure delay = BASE_RETRY_DELAY * (2 ** attempt).
+        What it does: Verifies retry delays respect jittered exponential bounds.
+        Purpose: After adding full jitter, each delay must fall within
+                 [0, min(BASE_RETRY_DELAY * 2**attempt, MAX_RETRY_DELAY)].
         """
         print("Setup: Creating KiroHttpClient...")
         http_client = KiroHttpClient(mock_auth_manager_for_http)
@@ -554,11 +566,68 @@ class TestKiroHttpClientExponentialBackoff:
                         {"data": "value"}
                     )
         
-        print(f"Verification: Delays increase exponentially...")
+        print(f"Verification: Delays stay within jittered bounds...")
         print(f"Delays: {sleep_delays}")
         assert len(sleep_delays) == 2
-        assert sleep_delays[0] == BASE_RETRY_DELAY * (2 ** 0)  # 1.0
-        assert sleep_delays[1] == BASE_RETRY_DELAY * (2 ** 1)  # 2.0
+        # attempt 0: cap = min(1.0 * 1, 30.0) = 1.0
+        assert 0.0 <= sleep_delays[0] <= min(BASE_RETRY_DELAY * (2 ** 0), MAX_RETRY_DELAY)
+        # attempt 1: cap = min(1.0 * 2, 30.0) = 2.0
+        assert 0.0 <= sleep_delays[1] <= min(BASE_RETRY_DELAY * (2 ** 1), MAX_RETRY_DELAY)
+
+
+class TestComputeBackoffDelay:
+    """Tests for the compute_backoff_delay helper (jittered, capped backoff)."""
+
+    def test_delay_within_bounds_for_each_attempt(self):
+        """
+        What it does: Delay for attempt N stays in [0, base * 2**N].
+        Purpose: Full-jitter backoff must never exceed the per-attempt cap.
+        """
+        print("Action: Sampling delays across attempts...")
+        for attempt in range(5):
+            cap = min(1.0 * (2 ** attempt), 30.0)
+            for _ in range(100):  # sample jitter many times
+                delay = compute_backoff_delay(attempt, base_delay=1.0, max_delay=30.0)
+                assert 0.0 <= delay <= cap, f"attempt={attempt} delay={delay} cap={cap}"
+
+    def test_delay_respects_max_cap(self):
+        """
+        What it does: Large attempt indices are capped at max_delay.
+        Purpose: Exponential growth must not produce unbounded waits.
+        """
+        print("Action: Sampling delays for a large attempt index...")
+        for _ in range(100):
+            delay = compute_backoff_delay(20, base_delay=1.0, max_delay=5.0)
+            assert 0.0 <= delay <= 5.0
+
+    def test_zero_base_delay_yields_zero(self):
+        """
+        What it does: base_delay=0 always yields 0.
+        Purpose: Boundary condition - no wait when base is zero.
+        """
+        print("Action: Computing delay with zero base...")
+        for attempt in range(5):
+            assert compute_backoff_delay(attempt, base_delay=0.0, max_delay=30.0) == 0.0
+
+    def test_zero_max_delay_yields_zero(self):
+        """
+        What it does: max_delay=0 clamps everything to 0.
+        Purpose: Boundary condition - cap of zero disables waiting.
+        """
+        print("Action: Computing delay with zero cap...")
+        for attempt in range(5):
+            assert compute_backoff_delay(attempt, base_delay=1.0, max_delay=0.0) == 0.0
+
+    def test_jitter_produces_varied_values(self):
+        """
+        What it does: Repeated calls for the same attempt vary (jitter is real).
+        Purpose: Guard against accidentally returning a constant delay.
+        """
+        print("Action: Collecting repeated samples for one attempt...")
+        samples = {compute_backoff_delay(3, base_delay=1.0, max_delay=30.0) for _ in range(50)}
+        # With a continuous uniform draw over [0, 8], 50 samples should not collapse
+        # to a single value. (Probability of all-equal is effectively zero.)
+        assert len(samples) > 1
 
 
 class TestKiroHttpClientStreamingTimeout:
@@ -1433,7 +1502,11 @@ class TestTimeToHeadersDiagnostics:
         timing = [m for m in messages if m.startswith("Kiro API responded HTTP 200 after")]
         print(f"Timing logs: {timing}")
         assert len(timing) == 1
-        assert f"attempt 1/{FIRST_TOKEN_MAX_RETRIES if stream else MAX_RETRIES}" in timing[0]
+        # Non-streaming grants the larger server-error retry budget; streaming
+        # keeps the first-token budget. Mirror the implementation's logic here.
+        from kiro.config import SERVER_ERROR_MAX_RETRIES
+        expected_budget = FIRST_TOKEN_MAX_RETRIES if stream else max(MAX_RETRIES, SERVER_ERROR_MAX_RETRIES)
+        assert f"attempt 1/{expected_budget}" in timing[0]
         assert f"stream={stream}" in timing[0]
 
     @pytest.mark.asyncio

@@ -205,12 +205,26 @@ TOKEN_REFRESH_THRESHOLD: int = 600
 # Retry Configuration
 # ==================================================================================================
 
-# Maximum number of retry attempts on errors
-MAX_RETRIES: int = 3
+# Maximum number of retry attempts on errors (non-streaming requests)
+# Env-configurable so operators can be more patient when the upstream Kiro/Amazon
+# backend is transiently overloaded (HTTP 500 reason=MODEL_TEMPORARILY_UNAVAILABLE).
+MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "3"))
 
 # Base delay between attempts (seconds)
 # Uses exponential backoff: delay * (2 ** attempt)
-BASE_RETRY_DELAY: float = 1.0
+BASE_RETRY_DELAY: float = float(os.getenv("BASE_RETRY_DELAY", "1.0"))
+
+# Dedicated retry budget for retryable upstream server errors (HTTP 429 and 5xx,
+# e.g. MODEL_TEMPORARILY_UNAVAILABLE). These are transient Amazon-side overloads
+# that usually clear within a few seconds, so we retry more patiently than the
+# generic MAX_RETRIES before surfacing the error to the client.
+# Default: 5 attempts (vs 3 generic) - set to match your tolerance for latency.
+SERVER_ERROR_MAX_RETRIES: int = int(os.getenv("SERVER_ERROR_MAX_RETRIES", "5"))
+
+# Maximum backoff delay in seconds (caps exponential growth so a long retry
+# budget never produces an unbounded wait between attempts).
+# Default: 30 seconds.
+MAX_RETRY_DELAY: float = float(os.getenv("MAX_RETRY_DELAY", "30.0"))
 
 # ==================================================================================================
 # Hidden Models Configuration
