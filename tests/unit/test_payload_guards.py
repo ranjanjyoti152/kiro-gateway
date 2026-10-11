@@ -201,3 +201,98 @@ class TestTrimPayloadToLimit:
         assert not stats.trimmed
         assert stats.original_entries == 0
         assert stats.final_entries == 0
+
+
+SYSTEM_PROMPT = "SYSTEM_PROMPT_MARKER important operating rules for the model"
+
+
+def _make_payload_with_system_prompt(num_pairs=5, content_size=100, system_prompt=SYSTEM_PROMPT):
+    """
+    Build a payload where the system prompt is prepended to the first history
+    user message, exactly as build_kiro_payload does.
+    """
+    payload = _make_payload(num_pairs=num_pairs, content_size=content_size)
+    history = payload["conversationState"]["history"]
+    first_user = history[0]["userInputMessage"]
+    first_user["content"] = f"{system_prompt}\n\n{first_user['content']}"
+    return payload
+
+
+class TestTrimPreservesSystemPrompt:
+    """
+    Regression tests for the Claude Code context-loss bug: trimming must never
+    delete the system prompt that was prepended to the first history message.
+    """
+
+    def test_system_prompt_survives_heavy_trim(self):
+        """System prompt is retained even when most history is removed."""
+        payload = _make_payload_with_system_prompt(num_pairs=40, content_size=2000)
+        original_size = check_payload_size(payload)
+        limit = original_size // 4
+
+        stats = trim_payload_to_limit(payload, max_bytes=limit, system_prompt=SYSTEM_PROMPT)
+
+        assert stats.trimmed
+        assert stats.final_entries < stats.original_entries
+        blob = json.dumps(payload)
+        assert SYSTEM_PROMPT in blob, "System prompt must survive trimming"
+        # Must be on the first surviving user message
+        history = payload["conversationState"]["history"]
+        assert history[0]["userInputMessage"]["content"].startswith(SYSTEM_PROMPT)
+
+    def test_system_prompt_not_duplicated_when_no_trim(self):
+        """When nothing is trimmed, the prompt is not duplicated."""
+        payload = _make_payload_with_system_prompt(num_pairs=2, content_size=10)
+        original_size = check_payload_size(payload)
+
+        trim_payload_to_limit(payload, max_bytes=original_size + 1000, system_prompt=SYSTEM_PROMPT)
+
+        content = payload["conversationState"]["history"][0]["userInputMessage"]["content"]
+        assert content.count(SYSTEM_PROMPT) == 1
+
+    def test_system_prompt_not_duplicated_after_trim(self):
+        """After trimming, the prompt appears exactly once (strip + reattach)."""
+        payload = _make_payload_with_system_prompt(num_pairs=30, content_size=1500)
+        limit = check_payload_size(payload) // 3
+
+        trim_payload_to_limit(payload, max_bytes=limit, system_prompt=SYSTEM_PROMPT)
+
+        blob = json.dumps(payload)
+        # The marker token appears once in the prompt; ensure it is not doubled.
+        assert blob.count("SYSTEM_PROMPT_MARKER") == 1
+
+    def test_system_prompt_present_even_at_minimum_history(self):
+        """With an impossibly low limit (floor of 2 entries), prompt still survives."""
+        payload = _make_payload_with_system_prompt(num_pairs=10, content_size=1000)
+
+        trim_payload_to_limit(payload, max_bytes=100, system_prompt=SYSTEM_PROMPT)
+
+        history = payload["conversationState"]["history"]
+        assert len(history) >= 2
+        assert history[0]["userInputMessage"]["content"].startswith(SYSTEM_PROMPT)
+
+    def test_no_system_prompt_arg_is_backward_compatible(self):
+        """Omitting system_prompt preserves the original (lossy) behavior."""
+        payload = _make_payload_with_system_prompt(num_pairs=20, content_size=1500)
+        limit = check_payload_size(payload) // 4
+
+        # Without passing system_prompt, the old behavior applies: the first
+        # entries (including the prompt) may be trimmed away.
+        stats = trim_payload_to_limit(payload, max_bytes=limit)
+        assert stats.trimmed
+        # We don't assert the prompt is gone (depends on sizes), only that the
+        # call succeeds with the default argument - backward compatibility.
+        assert stats.final_entries >= 2
+
+    def test_fits_under_limit_with_prompt_reattached(self):
+        """Re-attaching the prompt must not push the payload back over the limit."""
+        payload = _make_payload_with_system_prompt(num_pairs=50, content_size=2000)
+        limit = check_payload_size(payload) // 5
+
+        trim_payload_to_limit(payload, max_bytes=limit, system_prompt=SYSTEM_PROMPT)
+
+        # Final size (prompt already re-attached) should respect the limit,
+        # unless we hit the 2-entry floor. Verify the floor case explicitly.
+        history = payload["conversationState"]["history"]
+        final_size = check_payload_size(payload)
+        assert final_size <= limit or len(history) <= 2

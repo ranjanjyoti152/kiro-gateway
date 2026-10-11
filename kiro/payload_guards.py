@@ -30,7 +30,7 @@ Ported from sametakofficial's payload_guards.py, simplified.
 
 import json
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 
 @dataclass
@@ -118,12 +118,90 @@ def _repair_orphaned_tool_results(history: list) -> None:
                 user_msg["content"] = current_content + marker
 
 
-def trim_payload_to_limit(payload: Dict[str, Any], max_bytes: int) -> PayloadTrimStats:
+def _first_user_message(history: list) -> Optional[Dict[str, Any]]:
+    """Return the first ``userInputMessage`` dict in history, or None."""
+    for entry in history:
+        user_msg = entry.get("userInputMessage")
+        if user_msg is not None:
+            return user_msg
+    return None
+
+
+def _strip_system_prompt(history: list, system_prompt: str) -> None:
+    """
+    Remove a leading system-prompt block from the first user message in-place.
+
+    ``build_kiro_payload`` prepends the system prompt to the first history user
+    message as ``f"{system_prompt}\\n\\n{original}"``. Trimming removes oldest
+    entries from the front, so without this the system prompt would be deleted.
+    We strip it here so it can be re-attached to whatever user message survives
+    trimming (see ``_reattach_system_prompt``), guaranteeing the model never
+    loses its operating instructions.
+
+    Args:
+        history: Kiro history list (mutated in place).
+        system_prompt: The exact system prompt string that was prepended.
+    """
+    first_user = _first_user_message(history)
+    if first_user is None:
+        return
+    content = first_user.get("content", "")
+    prefix = f"{system_prompt}\n\n"
+    if isinstance(content, str) and content.startswith(prefix):
+        first_user["content"] = content[len(prefix):]
+
+
+def _reattach_system_prompt(history: list, system_prompt: str) -> None:
+    """
+    Prepend the system prompt to the first user message in-place (idempotent).
+
+    Safe to call even if the prompt is already present: it checks first to
+    avoid duplicating the block.
+
+    Args:
+        history: Kiro history list (mutated in place).
+        system_prompt: The system prompt string to guarantee at the front.
+    """
+    first_user = _first_user_message(history)
+    if first_user is None:
+        return
+    content = first_user.get("content", "")
+    if not isinstance(content, str):
+        content = ""
+    prefix = f"{system_prompt}\n\n"
+    if content.startswith(prefix):
+        return  # already present
+    first_user["content"] = f"{prefix}{content}"
+
+
+def trim_payload_to_limit(
+    payload: Dict[str, Any],
+    max_bytes: int,
+    system_prompt: Optional[str] = None,
+) -> PayloadTrimStats:
     """
     Trim oldest history entries so the serialized payload fits under max_bytes.
 
     Trims in user/assistant pairs (2 entries at a time), aligns start to
     userInputMessage, and repairs orphaned toolResults after trimming.
+
+    System prompt preservation (fixes context loss in Claude Code): the caller
+    prepends the system prompt to the first history user message. Because
+    trimming removes entries from the front, that message (and the system
+    prompt with it) can be deleted, which strips the model's instructions and
+    makes it "lose context completely". When ``system_prompt`` is provided we
+    detach it before trimming and re-attach it to whichever user message
+    survives, so the instructions are always present regardless of how much
+    history is removed.
+
+    Args:
+        payload: Full Kiro payload (mutated in place).
+        max_bytes: Target maximum serialized size in bytes.
+        system_prompt: System prompt prepended to the first user message, if
+            any. When provided, it is preserved across trimming.
+
+    Returns:
+        PayloadTrimStats describing the trim operation.
     """
     original_bytes = check_payload_size(payload)
     history = payload.get("conversationState", {}).get("history")
@@ -139,11 +217,19 @@ def trim_payload_to_limit(payload: Dict[str, Any], max_bytes: int) -> PayloadTri
 
     original_entries = len(history)
 
+    # Detach the system prompt so it is not deleted when the first entries are
+    # trimmed; it will be re-attached to the surviving first user message.
+    if system_prompt:
+        _strip_system_prompt(history, system_prompt)
+
     # Strip empty toolUses before measuring
     _strip_empty_tool_uses(history)
 
-    # Trim pairs from the beginning until under limit (keep at least 2 entries)
-    while len(history) > 2 and check_payload_size(payload) > max_bytes:
+    # Trim pairs from the beginning until under limit (keep at least 2 entries).
+    # When a system prompt will be re-attached, account for its size in the
+    # measurement so re-attaching it afterwards does not push us back over.
+    system_prompt_overhead = len(f"{system_prompt}\n\n".encode("utf-8")) if system_prompt else 0
+    while len(history) > 2 and (check_payload_size(payload) + system_prompt_overhead) > max_bytes:
         # Remove 2 entries (a user/assistant pair)
         history.pop(0)
         history.pop(0)
@@ -153,6 +239,11 @@ def trim_payload_to_limit(payload: Dict[str, Any], max_bytes: int) -> PayloadTri
 
     # Repair orphaned tool results after trimming
     _repair_orphaned_tool_results(history)
+
+    # Re-attach the system prompt to the surviving first user message so the
+    # model always keeps its operating instructions.
+    if system_prompt:
+        _reattach_system_prompt(history, system_prompt)
 
     final_bytes = check_payload_size(payload)
     return PayloadTrimStats(

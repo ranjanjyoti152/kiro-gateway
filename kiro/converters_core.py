@@ -1592,11 +1592,18 @@ def build_kiro_payload(
     if profile_arn:
         payload["profileArn"] = profile_arn
 
-    # Payload size guard — auto-trim if enabled
+    # Payload size guard — auto-trim if enabled.
+    # Pass the system prompt so it is preserved across trimming: it was prepended
+    # to the first history user message, which trimming would otherwise delete,
+    # causing the model to lose its instructions ("context loss" in Claude Code).
     if AUTO_TRIM_PAYLOAD:
         payload_size = check_payload_size(payload)
         if payload_size > KIRO_MAX_PAYLOAD_BYTES:
-            stats = trim_payload_to_limit(payload, KIRO_MAX_PAYLOAD_BYTES)
+            stats = trim_payload_to_limit(
+                payload,
+                KIRO_MAX_PAYLOAD_BYTES,
+                system_prompt=full_system_prompt or None,
+            )
             logger.info(
                 f"Trimmed conversation history: {stats.original_entries} -> {stats.final_entries} messages "
                 f"({stats.original_bytes} -> {stats.final_bytes} bytes)"
